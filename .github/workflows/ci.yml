@@ -1,0 +1,223 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  # ── Frontend quality checks ─────────────────────────────────
+  frontend-checks:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: npm
+
+      # Il lockfile è generato da npm 11 in locale: npm 10 (bundled con
+      # Node 20) valida i peer di @swc/* in modo diverso e npm ci fallisce
+      # con "Missing @swc/helpers". Allineare la versione di npm.
+      - name: Align npm version
+        run: npm install -g npm@11
+
+      - name: Install dependencies
+        run: npm ci
+        env:
+          DATABASE_URL: "file:./dev.db"
+
+      # Gate BLOCCANTE dal 2026-06-11 (baseline portata a 0 errori).
+      # Niente pipe a tail: in pwsh maschererebbe l'exit code di tsc.
+      - name: TypeScript type check
+        run: npx tsc --noEmit
+
+      # Gate BLOCCANTE dal 2026-06-11 (78 errori bonificati a 0; i warning
+      # non bloccano — next lint esce 0 con soli warning).
+      - name: ESLint
+        run: npm run lint
+
+      # Gate anti testo hardcoded (ratchet vs scripts/.i18n-baseline.json).
+      # Fallisce se il numero di stringhe hardcoded user-facing AUMENTA →
+      # ogni nuova stringa UI deve passare da t()/i18n. Abbassare la baseline
+      # man mano che si bonifica: npm run i18n:check:update.
+      - name: i18n no-hardcoded guard
+        run: npm run i18n:check
+
+      # Gate anti `invoke` nel vuoto (ratchet vs scripts/.tauri-commands-baseline.json).
+      # TypeScript non sa quali comandi esistano lato Rust: un invoke verso un comando
+      # inesistente — o esistente ma non nel generate_handler! — compila e fallisce solo
+      # a runtime, dentro un catch. È così che il pulsante Sfoglia dell'iniettore è
+      # rimasto rotto per mesi. Fallisce se compare un comando NUOVO fuori baseline.
+      - name: Tauri command guard
+        run: npm run tauri:check-cmds
+
+      # Gate npm-vs-crate (difetto 6 della ship v1.16.0).
+      # La PR Dependabot npm-minor-patch del 04/08 ha portato @tauri-apps/cli+api
+      # a 2.11 col crate tauri fermo a 2.10.3: `tauri build` rifiuta i minor
+      # disallineati, ma il danno si è visto SOLO in release. Questo gate confronta
+      # le versioni RISOLTE nei due lockfile (npm e Cargo) e ferma la CI — quindi
+      # anche la PR Dependabot stessa — quando i minor divergono.
+      - name: Tauri npm-vs-crate parity guard
+        run: npm run tauri:parity
+
+      # Gate anti file-di-gioco nel repo.
+      # Il 02/08/2026 estratti_pak/ è risultata TRACCIATA: 18 file estratti dal .pak
+      # di un gioco commerciale già su origin/main, cioè su un repo pubblico. Non per distrazione —
+      # il .gitignore elencava le cartelle una a una e quella, nata dopo con un nome
+      # nuovo, non era nell'elenco. Il .gitignore ora usa un glob, ma un glob copre
+      # solo il nome che abbiamo già visto: questo gate guarda il CONTENUTO, cioè
+      # l'estensione, e ferma la CI se un .locres/.pak/.win/.rpa risulta tracciato
+      # fuori da __tests__/fixtures/. Conta perché è esattamente ciò che il progetto
+      # promette di non fare (ANTI_PIRACY.md, "solo diff" dei .gspack).
+      - name: Game asset guard
+        run: npm run assets:check
+
+      # Gate anti moduli morti (ratchet vs scripts/.dead-modules-baseline.json).
+      # 95 file su 618 non sono raggiunti da nessun import: 32.126 righe che costano
+      # due volte — quando le mantieni credendole vive, e quando ti fanno credere che
+      # una funzione esista già. Fallisce se ne compare uno NUOVO, così il debito può
+      # solo scendere. Prima di cancellare, leggere i limiti in cima allo script.
+      - name: Dead module guard
+        run: npm run dead:check
+
+      # Gate anti dipendenze orfane (scripts/check-orphan-deps.js).
+      # Il 03/08 ne sono state rimosse 20 in un colpo solo: il problema non era
+      # rimuoverle, era che si erano accumulate senza che nessuno se ne accorgesse.
+      # ⚠️ Il gate dice «nessuno la importa», NON «è inutile»: gli usi impliciti
+      # (autoprefixer & C. caricati per nome da postcss.config.js) stanno in
+      # USI_IMPLICITI dentro lo script, ognuno CON IL MOTIVO — rimuoverli avrebbe
+      # rotto build CSS e typecheck con un errore che non somiglia alla causa.
+      # ⛔ Cablato qui il 10/08/2026: lo script esisteva ed era verde dal 10/08, ma
+      # non era in package.json né in questo file — nessuno lo eseguiva mai. Un gate
+      # scollegato è peggio del nulla: la sua esistenza dà per chiusa una questione
+      # aperta. Provato a fallire con una dipendenza finta prima di dichiararlo vivo.
+      - name: Orphan dependency guard
+        run: npm run deps:check
+
+      # Gate accessibilità (ratchet vs scripts/.a11y-baseline.json).
+      # 80 punti noti: 77 <div> cliccabili non raggiungibili da tastiera e 3 backdrop.
+      # L'audit del 24/07 ne contava 7 — nessuno li stava contando, e crescevano.
+      # ⚠️ I 3 backdrop NON vanno resi focusabili: il rimedio è Esc sul dialogo, e
+      # role+tabIndex li peggiorerebbe. I limiti sono scritti in cima allo script:
+      # leggerli prima di correggere in blocco quello che elenca.
+      # Non usa axe-core perché axe richiede un browser e l'app in esecuzione, e in
+      # playwright.config.ts il webServer è disabilitato: un gate che in CI non può
+      # partire dà solo l'impressione di essere protetti. axe resta il passo dopo,
+      # per contrasto e focus visibile, che solo il runtime può dire.
+      - name: Accessibility guard
+        run: npm run a11y:check
+
+      # Gate BLOCCANTE dal 2026-06-11 (suite bonificata: 464 passed,
+      # 0 failed, 37 skip documentati — vedi i TODO nei singoli file).
+      - name: Unit tests
+        run: npm run test:run
+
+      - name: Security audit
+        run: npm audit --audit-level=high || true
+
+  # ── Rust backend checks ─────────────────────────────────────
+  check-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Create frontend dist stub
+        run: mkdir out && echo "<html></html>" > out/index.html
+
+      - name: Cargo check (Windows)
+        working-directory: src-tauri
+        run: cargo check --verbose
+
+      # Suite Rust completa. I due test di isolamento prima flaky in parallelo sono
+      # stati isolati (2026-06-14): helper notifications → tempfile::tempdir() e
+      # rimosso il save detached in load_profile che faceva race con i save espliciti.
+      # Verde in parallelo: 1086 passed, 0 failed, 42 #[ignore]. Vedi docs/RUST-TEST-TRIAGE.md.
+      - name: Cargo test
+        working-directory: src-tauri
+        run: cargo test --verbose
+
+  # ⚠️ Prima del 30/07/2026 NESSUN workflow compilava il C++ di gs-hook: la DLL
+  # esisteva solo sul PC di Davide (artefatti del 13/06) e un errore di
+  # compilazione non fermava niente. Da quando la release la builda davvero, un
+  # errore qui fermerebbe la RELEASE — cioè lo scopriremmo nel momento peggiore.
+  # Questo job lo scopre al push, che costa qualche minuto invece di un rilascio.
+  # Non produce artefatti: verifica solo che compili, dual-arch come in release.
+  build-gs-hook:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true   # MinHook è un submodule: senza, add_subdirectory fallisce
+
+      - name: Configure + build gs-hook (x64)
+        run: |
+          cmake -S gs-hook -B out-gs-hook-x64 -A x64
+          cmake --build out-gs-hook-x64 --config Release
+
+      - name: Configure + build gs-hook (x86)
+        run: |
+          cmake -S gs-hook -B out-gs-hook-x86 -A Win32
+          cmake --build out-gs-hook-x86 --config Release
+
+      - name: Gli artefatti attesi esistono
+        shell: pwsh
+        run: |
+          $expected = @(
+            "out-gs-hook-x64\bin\Release\gs-hook.dll",
+            "out-gs-hook-x64\bin\Release\gs-injector.exe",
+            "out-gs-hook-x86\bin\Release\gs-hook.dll",
+            "out-gs-hook-x86\bin\Release\gs-injector.exe"
+          )
+          $missing = $expected | Where-Object { !(Test-Path $_) }
+          if ($missing) {
+            Write-Host "::error::gs-hook: artefatti mancanti: $($missing -join ', ')"
+            Write-Host "Se i nomi sono cambiati, aggiornare anche gs-hook/build-all.ps1 e release.yml."
+            exit 1
+          }
+          $expected | ForEach-Object { Write-Host "OK  $_" }
+
+  check-linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libssl-dev \
+            libgtk-3-dev
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Create frontend dist stub
+        run: mkdir -p out && echo '<html></html>' > out/index.html
+
+      - name: Cargo check (Linux)
+        working-directory: src-tauri
+        run: cargo check --verbose

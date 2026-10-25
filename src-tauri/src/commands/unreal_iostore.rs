@@ -1,0 +1,4207 @@
+//! Unreal Engine IoStore Reader (UTOC/UCAS)
+//!
+//! Parsa container IoStore per estrarre asset (.locres, .uasset, ecc.)
+//! Supporta decompressione Oodle tramite caricamento dinamico della DLL.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+#[allow(unused_imports)]
+use super::unreal_localization::ExtractionResult;
+
+const UTOC_MAGIC: &[u8; 16] = b"-==--==--==--==-";
+const INVALID_INDEX: u32 = 0xFFFFFFFF;
+
+/// Versione UTOC più recente su cui il parser è stato verificato.
+/// UE 5.3 = v5 (PerfectHash). Le versioni superiori vengono lette best-effort
+/// trattando i campi extra come padding; lo segnaliamo così, se un gioco nuovo
+/// si estrae male, la causa è evidente invece di apparire come "container vuoto".
+const UTOC_MAX_KNOWN_VERSION: u8 = 5;
+
+// ═══════════════════════════════════════════════════════════════════
+// TYPES
+// ═══════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct UtocHeader {
+    version: u8,
+    header_size: u32,
+    entry_count: u32,
+    compressed_block_entry_count: u32,
+    compressed_block_entry_size: u32,
+    compression_method_name_count: u32,
+    compression_method_name_length: u32,
+    compression_block_size: u32,
+    directory_index_size: u32,
+    partition_count: u32,
+    container_id: u64,
+    encryption_key_guid: [u8; 16],
+    container_flags: u8,
+    perfect_hash_seeds_count: u32,
+    chunks_without_ph_count: u32,
+}
+
+#[derive(Debug, Clone)]
+struct IoOffsetAndLength {
+    offset: u64,
+    length: u64,
+}
+
+#[derive(Debug, Clone)]
+struct CompressedBlockEntry {
+    offset: u64,
+    compressed_size: u32,
+    uncompressed_size: u32,
+    compression_method_index: u8,
+}
+
+#[derive(Debug, Clone)]
+struct DirectoryIndexEntry {
+    name: u32,
+    first_child_entry: u32,
+    next_sibling_entry: u32,
+    first_file_entry: u32,
+}
+
+#[derive(Debug, Clone)]
+struct FileIndexEntry {
+    name: u32,
+    next_file_entry: u32,
+    user_data: u32, // TocEntry index
+}
+
+#[derive(Debug, Clone)]
+struct IoStoreFile {
+    path: String,
+    toc_entry_index: u32,
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// BINARY READ HELPERS
+// ═══════════════════════════════════════════════════════════════════
+
+fn read_u8(data: &[u8], offset: &mut usize) -> Result<u8, String> {
+    if *offset >= data.len() { return Err(format!("EOF@{}", offset)); }
+    let v = data[*offset];
+    *offset += 1;
+    Ok(v)
+}
+
+fn read_u32(data: &[u8], offset: &mut usize) -> Result<u32, String> {
+    if *offset + 4 > data.len() { return Err(format!("EOF@{}", offset)); }
+    let v = u32::from_le_bytes([data[*offset], data[*offset+1], data[*offset+2], data[*offset+3]]);
+    *offset += 4;
+    Ok(v)
+}
+
+fn read_i32(data: &[u8], offset: &mut usize) -> Result<i32, String> {
+    if *offset + 4 > data.len() { return Err(format!("EOF@{}", offset)); }
+    let v = i32::from_le_bytes([data[*offset], data[*offset+1], data[*offset+2], data[*offset+3]]);
+    *offset += 4;
+    Ok(v)
+}
+
+fn read_u64(data: &[u8], offset: &mut usize) -> Result<u64, String> {
+    if *offset + 8 > data.len() { return Err(format!("EOF@{}", offset)); }
+    let v = u64::from_le_bytes([
+        data[*offset], data[*offset+1], data[*offset+2], data[*offset+3],
+        data[*offset+4], data[*offset+5], data[*offset+6], data[*offset+7],
+    ]);
+    *offset += 8;
+    Ok(v)
+}
+
+fn read_fstring(data: &[u8], offset: &mut usize) -> Result<String, String> {
+    let length = read_i32(data, offset)?;
+    if length == 0 { return Ok(String::new()); }
+    
+    if length > 0 {
+        let len = length as usize;
+        if *offset + len > data.len() { return Err(format!("FString EOF@{}", offset)); }
+        let bytes = &data[*offset..*offset + len];
+        *offset += len;
+        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+        Ok(String::from_utf8_lossy(&bytes[..end]).to_string())
+    } else {
+        let char_count = (-length) as usize;
+        let byte_count = char_count * 2;
+        if *offset + byte_count > data.len() { return Err(format!("FString16 EOF@{}", offset)); }
+        let mut chars = Vec::with_capacity(char_count);
+        for _ in 0..char_count {
+            let lo = data[*offset] as u16;
+            let hi = data[*offset + 1] as u16;
+            chars.push(lo | (hi << 8));
+            *offset += 2;
+        }
+        if let Some(pos) = chars.iter().position(|&c| c == 0) { chars.truncate(pos); }
+        String::from_utf16(&chars).map_err(|e| format!("UTF-16: {}", e))
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// OODLE DECOMPRESSION
+// ═══════════════════════════════════════════════════════════════════
+
+type OodleDecompressFn = unsafe extern "C" fn(
+    comp_buf: *const u8,
+    comp_buf_size: i64,
+    raw_buf: *mut u8,
+    raw_len: i64,
+    fuzz_safe: i32,
+    check_crc: i32,
+    verbosity: i32,
+    dec_buf_base: *const u8,
+    dec_buf_size: i64,
+    fp_callback: *const u8,
+    callback_user_data: *const u8,
+    decoder_memory: *const u8,
+    decoder_memory_size: i64,
+    thread_phase: i32,
+) -> i64;
+
+struct OodleLib {
+    _lib: libloading::Library,
+    decompress: OodleDecompressFn,
+}
+
+impl OodleLib {
+    fn load() -> Result<Self, String> {
+        let dll_paths = find_oodle_dll();
+        
+        if dll_paths.is_empty() {
+            return Err("DLL Oodle (oo2core_9_win64.dll) non trovata. Installa Unreal Engine o copia la DLL.".into());
+        }
+        
+        for path in &dll_paths {
+            log::info!("🔧 Tentativo caricamento Oodle: {}", path.display());
+            
+            unsafe {
+                match libloading::Library::new(path) {
+                    Ok(lib) => {
+                        let decompress: libloading::Symbol<OodleDecompressFn> = lib.get(b"OodleLZ_Decompress")
+                            .map_err(|e| format!("Simbolo OodleLZ_Decompress non trovato: {}", e))?;
+                        let decompress_fn = *decompress;
+                        
+                        log::info!("✅ Oodle caricata da: {}", path.display());
+                        return Ok(OodleLib {
+                            _lib: lib,
+                            decompress: decompress_fn,
+                        });
+                    }
+                    Err(e) => {
+                        log::warn!("⚠️ Impossibile caricare {}: {}", path.display(), e);
+                        continue;
+                    }
+                }
+            }
+        }
+        
+        Err(format!("Impossibile caricare Oodle da nessun path: {:?}", dll_paths))
+    }
+    
+    fn decompress(&self, compressed: &[u8], uncompressed_size: usize) -> Result<Vec<u8>, String> {
+        let mut output = vec![0u8; uncompressed_size];
+        
+        let result = unsafe {
+            (self.decompress)(
+                compressed.as_ptr(),
+                compressed.len() as i64,
+                output.as_mut_ptr(),
+                uncompressed_size as i64,
+                1, // fuzz_safe
+                0, // check_crc
+                0, // verbosity
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                3, // thread_phase
+            )
+        };
+        
+        if result <= 0 {
+            return Err(format!("Oodle decompression failed: returned {}", result));
+        }
+        
+        Ok(output)
+    }
+}
+
+/// Cerca oo2core DLL in varie posizioni, inclusa la cartella del gioco
+pub fn find_oodle_dll_with_game(game_path: Option<&Path>) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    // Nomi possibili della Oodle Data DLL, dal più recente al più vecchio.
+    // ⚠️ UE 5.8 (2025) l'ha RINOMINATA da `oo2core_9_win64.dll` a `oo2core.dll`
+    // nuda (in .../runtimes/win-x64/native/). NON confondere con `oo2tex_*`
+    // (Oodle Texture) né `oo2texrt_*`: quelle non decomprimono i .locres.
+    let dll_names = [
+        "oo2core.dll",
+        "oo2core_9_win64.dll",
+        "oo2core_8_win64.dll",
+        "oo2core_7_win64.dll",
+    ];
+
+    // 1. Cache GameStringer (%APPDATA%/GameStringer/tools/)
+    if let Some(gs_tools) = dirs::data_dir().map(|d| d.join("GameStringer").join("tools")) {
+        for dll in &dll_names {
+            let p = gs_tools.join(dll);
+            if p.exists() { paths.push(p); }
+        }
+    }
+
+    // 2. Nella cartella del gioco stesso e Binaries/Win64/
+    // Molti giochi UE shippano la DLL accanto all'eseguibile
+    if let Some(gp) = game_path {
+        let scan_roots = vec![
+            gp.to_path_buf(),
+            gp.join("Binaries").join("Win64"),
+            gp.join("Binaries").join("WinGDK"),
+        ];
+        // Anche una cartella nidificata: <Gioco>/<NomeProgetto>/Binaries/Win64/
+        if let Ok(entries) = std::fs::read_dir(gp) {
+            for entry in entries.flatten() {
+                let sub = entry.path().join("Binaries").join("Win64");
+                if sub.is_dir() {
+                    let _ = scan_roots.iter(); // solo per non aver warning
+                    for dll in &dll_names {
+                        let p = sub.join(dll);
+                        if p.exists() { paths.push(p.clone()); }
+                    }
+                }
+            }
+        }
+        for root in &scan_roots {
+            for dll in &dll_names {
+                let p = root.join(dll);
+                if p.exists() { paths.push(p.clone()); }
+            }
+        }
+    }
+
+    // 3. Installazioni UE — scoperta DINAMICA invece di una lista fissa.
+    // La lista cablata (fino a UE_5.7) mancava la 5.8 e ogni futura release: qui
+    // enumeriamo le cartelle `UE_*` sotto le radici comuni, su OGNI disco, così
+    // qualsiasi versione (5.8, 5.9, …) viene trovata senza toccare il codice.
+    let mut ue_bases: Vec<PathBuf> = Vec::new();
+    let mut root_dirs: Vec<PathBuf> = Vec::new();
+    // Radici tipiche su tutti i dischi montati (Windows: A..Z).
+    for letter in b'C'..=b'Z' {
+        let drive = format!("{}:\\", letter as char);
+        root_dirs.push(PathBuf::from(&drive)); // es. C:\UE_5.8
+        root_dirs.push(PathBuf::from(&drive).join("Program Files").join("Epic Games"));
+        root_dirs.push(PathBuf::from(&drive).join("Epic Games"));
+    }
+    for root in &root_dirs {
+        if let Ok(entries) = std::fs::read_dir(root) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                let name = p.file_name().unwrap_or_default().to_string_lossy();
+                // UE_5.x / UE_4.27 / anche "UE5" senza punto.
+                if name.starts_with("UE_") || name.starts_with("UE5") || name.starts_with("UE4") {
+                    ue_bases.push(p);
+                }
+            }
+        }
+    }
+    for base in &ue_bases {
+        let b = base.clone();
+        for dll in &dll_names {
+            for subpath in &[
+                // UE 5.8+: `oo2core.dll` sta in runtimes/win-x64/native sotto vari tool .NET.
+                vec!["Engine", "Binaries", "DotNET", "AutomationTool", "runtimes", "win-x64", "native"],
+                vec!["Engine", "Binaries", "DotNET", "UnrealBuildTool", "runtimes", "win-x64", "native"],
+                // UE ≤5.7: Oodle era una ThirdParty accanto ai binari.
+                vec!["Engine", "Binaries", "ThirdParty", "Oodle", "Win64"],
+                vec!["Engine", "Binaries", "ThirdParty", "Oodle", "Mac"],
+                vec!["Engine", "Binaries", "Win64"],
+                vec!["Engine", "Binaries", "DotNET", "AutomationTool"],
+                vec!["Engine", "Binaries", "DotNET", "UnrealBuildTool"],
+            ] {
+                let mut p = b.clone();
+                for s in subpath { p = p.join(s); }
+                p = p.join(dll);
+                if p.exists() { paths.push(p); }
+            }
+        }
+    }
+
+    // 4. Accanto all'exe di GameStringer
+    if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+        for ver in &["9", "8", "7"] {
+            let p = dir.join(format!("oo2core_{}_win64.dll", ver));
+            if p.exists() { paths.push(p); }
+        }
+    }
+
+    paths.dedup();
+    paths
+}
+
+/// Compatibilità: cerca senza game path
+fn find_oodle_dll() -> Vec<PathBuf> {
+    find_oodle_dll_with_game(None)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// UTOC PARSER
+// ═══════════════════════════════════════════════════════════════════
+
+fn parse_utoc_header(data: &[u8]) -> Result<UtocHeader, String> {
+    if data.len() < 144 {
+        return Err("UTOC troppo piccolo".into());
+    }
+    
+    // Verifica magic
+    if &data[0..16] != UTOC_MAGIC {
+        return Err("Magic UTOC non valido".into());
+    }
+    
+    let mut off = 16usize;
+    let version = read_u8(data, &mut off)?;
+    let _reserved = [read_u8(data, &mut off)?, read_u8(data, &mut off)?, read_u8(data, &mut off)?];
+    let header_size = read_u32(data, &mut off)?;
+    let entry_count = read_u32(data, &mut off)?;
+    let compressed_block_entry_count = read_u32(data, &mut off)?;
+    let compressed_block_entry_size = read_u32(data, &mut off)?;
+    let compression_method_name_count = read_u32(data, &mut off)?;
+    let compression_method_name_length = read_u32(data, &mut off)?;
+    let compression_block_size = read_u32(data, &mut off)?;
+    let directory_index_size = read_u32(data, &mut off)?;
+    let partition_count = read_u32(data, &mut off)?;
+    let container_id = read_u64(data, &mut off)?;
+    
+    let mut encryption_key_guid = [0u8; 16];
+    encryption_key_guid.copy_from_slice(&data[off..off + 16]);
+    off += 16;
+    
+    let container_flags = read_u8(data, &mut off)?;
+    
+    // v5+ (PerfectHash): skip padding, read PerfectHashSeedsCount + PartitionSize
+    let mut perfect_hash_seeds_count = 0u32;
+    let mut chunks_without_ph_count = 0u32;
+    
+    if version >= 4 {
+        // 3 bytes padding after container_flags to align to 4 bytes
+        off += 3;
+        perfect_hash_seeds_count = read_u32(data, &mut off)?;
+        // PartitionSize (u64 per partition) - skip
+        off += 8 * (partition_count as usize);
+    }
+    
+    if version >= 5 {
+        chunks_without_ph_count = read_u32(data, &mut off)?;
+    }
+    
+    log::info!("📦 UTOC v{}: {} entry, {} compressed blocks, {} partitions, {} PH seeds",
+        version, entry_count, compressed_block_entry_count, partition_count, perfect_hash_seeds_count);
+
+    // Le versioni oltre quella nota vengono lette come v5 con i campi ignoti
+    // paddati: può funzionare, ma va detto chiaramente. Non è un errore fatale
+    // (molti giochi UE 5.4/5.5 restano leggibili così), solo un avviso.
+    if version > UTOC_MAX_KNOWN_VERSION {
+        log::warn!(
+            "⚠️ UTOC v{} più recente della v{} testata: lettura best-effort, \
+             alcuni asset potrebbero non estrarsi. Verificare i risultati.",
+            version, UTOC_MAX_KNOWN_VERSION
+        );
+    }
+
+    Ok(UtocHeader {
+        version, header_size, entry_count,
+        compressed_block_entry_count, compressed_block_entry_size,
+        compression_method_name_count, compression_method_name_length,
+        compression_block_size, directory_index_size, partition_count,
+        container_id, encryption_key_guid, container_flags,
+        perfect_hash_seeds_count, chunks_without_ph_count,
+    })
+}
+
+fn parse_utoc_data(data: &[u8], header: &UtocHeader) -> Result<(
+    Vec<IoOffsetAndLength>,
+    Vec<CompressedBlockEntry>,
+    Vec<String>,
+    Vec<IoStoreFile>,
+), String> {
+    let hs = header.header_size as usize;
+    let ec = header.entry_count as usize;
+    
+    // Skip ChunkIds (12 bytes each)
+    let chunk_ids_offset = hs;
+    let chunk_ids_size = ec * 12;
+    
+    // OffsetAndLengths (10 bytes each)
+    let oal_offset = chunk_ids_offset + chunk_ids_size;
+    let mut offset_lengths = Vec::with_capacity(ec);
+    
+    for i in 0..ec {
+        let base = oal_offset + i * 10;
+        if base + 10 > data.len() {
+            return Err(format!("UTOC OffsetAndLength overflow at entry {}", i));
+        }
+        
+        // 5 bytes offset (big-endian)
+        let file_offset = ((data[base] as u64) << 32)
+            | ((data[base + 1] as u64) << 24)
+            | ((data[base + 2] as u64) << 16)
+            | ((data[base + 3] as u64) << 8)
+            | (data[base + 4] as u64);
+        
+        // 5 bytes length (big-endian)
+        let file_length = ((data[base + 5] as u64) << 32)
+            | ((data[base + 6] as u64) << 24)
+            | ((data[base + 7] as u64) << 16)
+            | ((data[base + 8] as u64) << 8)
+            | (data[base + 9] as u64);
+        
+        offset_lengths.push(IoOffsetAndLength {
+            offset: file_offset,
+            length: file_length,
+        });
+    }
+    
+    // PerfectHashSeeds (4 bytes each, v5+)
+    let phs_offset = oal_offset + ec * 10;
+    let phs_count = header.perfect_hash_seeds_count as usize;
+    let phs_size = phs_count * 4;
+    
+    // ChunkIndicesWithoutPerfectHash (4 bytes each, v6+)
+    let cwph_offset = phs_offset + phs_size;
+    let cwph_count = header.chunks_without_ph_count as usize;
+    let cwph_size = cwph_count * 4;
+    
+    log::info!("📦 Sections: ChunkIds@{}, OAL@{}, PHS@{} ({}), CWPH@{} ({})",
+        chunk_ids_offset, oal_offset, phs_offset, phs_count, cwph_offset, cwph_count);
+    
+    // CompressedBlockEntries (12 bytes each)
+    let cbe_offset = cwph_offset + cwph_size;
+    let cbe_count = header.compressed_block_entry_count as usize;
+    let mut compressed_blocks = Vec::with_capacity(cbe_count);
+    
+    for i in 0..cbe_count {
+        let base = cbe_offset + i * 12;
+        if base + 12 > data.len() {
+            return Err(format!("UTOC CompressedBlock overflow at {}", i));
+        }
+        
+        // 5 bytes offset (LITTLE-endian per UE5 FIoStoreTocCompressedBlockEntry)
+        let block_offset = (data[base] as u64)
+            | ((data[base + 1] as u64) << 8)
+            | ((data[base + 2] as u64) << 16)
+            | ((data[base + 3] as u64) << 24)
+            | ((data[base + 4] as u64) << 32);
+        
+        // 3 bytes compressed size (little-endian)
+        let comp_size = (data[base + 5] as u32)
+            | ((data[base + 6] as u32) << 8)
+            | ((data[base + 7] as u32) << 16);
+        
+        // 3 bytes uncompressed size (little-endian)
+        let uncomp_size = (data[base + 8] as u32)
+            | ((data[base + 9] as u32) << 8)
+            | ((data[base + 10] as u32) << 16);
+        
+        let method_index = data[base + 11];
+        
+        compressed_blocks.push(CompressedBlockEntry {
+            offset: block_offset,
+            compressed_size: comp_size,
+            uncompressed_size: uncomp_size,
+            compression_method_index: method_index,
+        });
+    }
+    
+    // CompressionMethodNames
+    let cmn_offset = cbe_offset + cbe_count * 12;
+    let cmn_count = header.compression_method_name_count as usize;
+    let cmn_len = header.compression_method_name_length as usize;
+    let mut compression_methods = Vec::with_capacity(cmn_count);
+    
+    for i in 0..cmn_count {
+        let base = cmn_offset + i * cmn_len;
+        if base + cmn_len > data.len() {
+            return Err(format!("UTOC CompressionMethod overflow at {}", i));
+        }
+        let name_bytes = &data[base..base + cmn_len];
+        let end = name_bytes.iter().position(|&b| b == 0).unwrap_or(cmn_len);
+        let name = String::from_utf8_lossy(&name_bytes[..end]).to_string();
+        compression_methods.push(name);
+    }
+    
+    log::info!("📦 Compression methods: {:?}", compression_methods);
+    
+    // DirectoryIndex
+    let dir_offset = cmn_offset + cmn_count * cmn_len;
+    let dir_size = header.directory_index_size as usize;
+    
+    if dir_offset + dir_size > data.len() {
+        return Err("UTOC DirectoryIndex overflow".into());
+    }
+    
+    if dir_size == 0 {
+        log::info!("📦 DirectoryIndex vuoto, skip");
+        return Ok((offset_lengths, compressed_blocks, compression_methods, Vec::new()));
+    }
+    
+    let dir_data = &data[dir_offset..dir_offset + dir_size];
+    let files = parse_directory_index(dir_data)?;
+    
+    log::info!("📦 Files nel container: {}", files.len());
+    
+    // Debug: mostra primi 10 file trovati
+    for (i, f) in files.iter().take(10).enumerate() {
+        log::info!("📦 File[{}]: '{}' (entry {})", i, f.path, f.toc_entry_index);
+    }
+    
+    // Debug: cerca .locres nei file trovati
+    let locres_count = files.iter().filter(|f| f.path.ends_with(".locres")).count();
+    log::info!("📦 .locres trovati nel container: {}", locres_count);
+    
+    Ok((offset_lengths, compressed_blocks, compression_methods, files))
+}
+
+fn parse_directory_index(data: &[u8]) -> Result<Vec<IoStoreFile>, String> {
+    let mut off = 0usize;
+    
+    // MountPoint
+    let mount_point = read_fstring(data, &mut off)?;
+    log::info!("📦 Mount point: '{}'", mount_point);
+    
+    // Directory entries
+    let dir_count = read_u32(data, &mut off)? as usize;
+    let mut dir_entries = Vec::with_capacity(dir_count);
+    
+    for _ in 0..dir_count {
+        dir_entries.push(DirectoryIndexEntry {
+            name: read_u32(data, &mut off)?,
+            first_child_entry: read_u32(data, &mut off)?,
+            next_sibling_entry: read_u32(data, &mut off)?,
+            first_file_entry: read_u32(data, &mut off)?,
+        });
+    }
+    
+    // File entries
+    let file_count = read_u32(data, &mut off)? as usize;
+    let mut file_entries = Vec::with_capacity(file_count);
+    
+    for _ in 0..file_count {
+        file_entries.push(FileIndexEntry {
+            name: read_u32(data, &mut off)?,
+            next_file_entry: read_u32(data, &mut off)?,
+            user_data: read_u32(data, &mut off)?,
+        });
+    }
+    
+    // String table
+    let string_count = read_u32(data, &mut off)? as usize;
+    let mut string_table = Vec::with_capacity(string_count);
+    
+    for _ in 0..string_count {
+        string_table.push(read_fstring(data, &mut off)?);
+    }
+    
+    log::info!("📦 DirIndex: {} dirs, {} files, {} strings", dir_entries.len(), file_entries.len(), string_table.len());
+    if !string_table.is_empty() {
+        log::info!("📦 First strings: {:?}", &string_table[..std::cmp::min(5, string_table.len())]);
+    }
+    if !dir_entries.is_empty() {
+        let d = &dir_entries[0];
+        log::info!("📦 Root dir[0]: name={}, child={}, sibling={}, files={}", d.name, d.first_child_entry, d.next_sibling_entry, d.first_file_entry);
+    }
+    
+    // Build parent map (iterative — no recursion)
+    let mut dir_parent: Vec<u32> = vec![INVALID_INDEX; dir_entries.len()];
+    for (i, de) in dir_entries.iter().enumerate() {
+        let mut child = de.first_child_entry;
+        while child != INVALID_INDEX && (child as usize) < dir_entries.len() {
+            dir_parent[child as usize] = i as u32;
+            child = dir_entries[child as usize].next_sibling_entry;
+        }
+    }
+    
+    // Build path for a directory by walking up the parent chain
+    let build_dir_path = |dir_idx: usize| -> String {
+        let mut parts: Vec<&str> = Vec::new();
+        let mut current = dir_idx;
+        loop {
+            let de = &dir_entries[current];
+            if de.name != INVALID_INDEX && (de.name as usize) < string_table.len() {
+                parts.push(&string_table[de.name as usize]);
+            }
+            let p = dir_parent[current];
+            if p == INVALID_INDEX || p as usize >= dir_entries.len() {
+                break;
+            }
+            current = p as usize;
+        }
+        parts.reverse();
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", parts.join("/"))
+        }
+    };
+    
+    // Collect all files iteratively
+    let mut files = Vec::new();
+    let mut dirs_with_files = 0u32;
+    
+    for (dir_idx, de) in dir_entries.iter().enumerate() {
+        if de.first_file_entry == INVALID_INDEX {
+            continue;
+        }
+        
+        dirs_with_files += 1;
+        let dir_path = build_dir_path(dir_idx);
+        
+        let mut file_idx = de.first_file_entry;
+        while file_idx != INVALID_INDEX && (file_idx as usize) < file_entries.len() {
+            let fe = &file_entries[file_idx as usize];
+            if (fe.name as usize) < string_table.len() {
+                files.push(IoStoreFile {
+                    path: format!("{}{}", dir_path, &string_table[fe.name as usize]),
+                    toc_entry_index: fe.user_data,
+                });
+            }
+            file_idx = fe.next_file_entry;
+        }
+    }
+    
+    log::info!("📦 Walker: {} dirs with files, {} total files collected", dirs_with_files, files.len());
+    
+    Ok(files)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// FTEXT SCANNER (for proper .locres override)
+// ═══════════════════════════════════════════════════════════════════
+
+/// Tenta di leggere un FString a un dato offset.
+/// FString = [i32 len (include null)] [bytes] [null]
+/// len > 0 → UTF-8, len < 0 → UTF-16 (|len| chars * 2 bytes)
+fn try_read_fstring_at(data: &[u8], off: &mut usize) -> Option<String> {
+    if *off + 4 > data.len() { return None; }
+    
+    let len = i32::from_le_bytes([data[*off], data[*off+1], data[*off+2], data[*off+3]]);
+    
+    if len == 0 {
+        *off += 4;
+        return Some(String::new());
+    }
+    
+    if len > 0 && len <= 10000 {
+        // UTF-8
+        let str_start = *off + 4;
+        let str_end = str_start + len as usize;
+        if str_end > data.len() { return None; }
+        if data[str_end - 1] != 0 { return None; }
+        
+        let text_bytes = &data[str_start..str_end - 1];
+        match std::str::from_utf8(text_bytes) {
+            Ok(s) => {
+                *off = str_end;
+                Some(s.to_string())
+            }
+            Err(_) => None
+        }
+    } else if (-10000..0).contains(&len) {
+        // UTF-16
+        let char_count = (-len) as usize;
+        let byte_count = char_count * 2;
+        let str_start = *off + 4;
+        let str_end = str_start + byte_count;
+        if str_end > data.len() { return None; }
+        
+        let u16_slice: Vec<u16> = (0..char_count)
+            .map(|j| u16::from_le_bytes([data[str_start + j*2], data[str_start + j*2 + 1]]))
+            .collect();
+        
+        match String::from_utf16(&u16_slice[..u16_slice.len().saturating_sub(1)]) {
+            Ok(s) => {
+                *off = str_end;
+                Some(s)
+            }
+            Err(_) => None
+        }
+    } else {
+        None
+    }
+}
+
+/// Scansiona un .uasset per pattern FText Base: [flags:u32][0x00][ns][key][src]
+/// Restituisce (namespace, key, source_text) per ogni FText trovato.
+fn scan_ftext_entries(data: &[u8]) -> Vec<(String, String, String)> {
+    let mut entries = Vec::new();
+    let mut i = 0usize;
+    
+    while i + 9 < data.len() {
+        // FText flags (4 bytes) + history_type Base (1 byte = 0x00)
+        let history_type = data[i + 4] as i8;
+        
+        if history_type == 0 {
+            let flags = u32::from_le_bytes([data[i], data[i+1], data[i+2], data[i+3]]);
+            
+            // Flags should be small (usually 0, sometimes 1-8 for various FText flags)
+            if flags <= 0xFF {
+                let mut off = i + 5;
+                let saved_off = off;
+                
+                if let Some(ns) = try_read_fstring_at(data, &mut off) {
+                    if let Some(key) = try_read_fstring_at(data, &mut off) {
+                        if let Some(src) = try_read_fstring_at(data, &mut off) {
+                            // Validate: ns e key non vuoti, src è testo significativo
+                            if !ns.is_empty() && !key.is_empty() 
+                                && src.len() >= 2
+                                && src.chars().any(|c| c.is_alphabetic())
+                                && !src.contains('\0')
+                            {
+                                entries.push((ns, key, src));
+                                i = off;
+                                continue;
+                            }
+                        }
+                    }
+                }
+                
+                // Reset se il pattern non era valido
+                let _ = saved_off;
+            }
+        }
+        
+        i += 1;
+    }
+    
+    entries
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// STRINGTABLE PARSER (proper namespace/key/value extraction)
+// ═══════════════════════════════════════════════════════════════════
+
+/// Parsa le entry di un UStringTable serializzato nel .uasset.
+/// Formato UE5 StringTable (dopo UObject properties):
+///   [FString TableNamespace][i32 NumEntries][FString Key, FString Value]...
+/// Restituisce (namespace, key, value) per ogni entry.
+fn scan_stringtable_entries(data: &[u8]) -> Vec<(String, String, String)> {
+    let data_offset = find_uasset_data_offset(data);
+    let mut best_result: Vec<(String, String, String)> = Vec::new();
+    
+    // Scansiona il data section cercando il pattern StringTable
+    let mut i = data_offset;
+    while i + 8 < data.len() {
+        let mut off = i;
+        
+        // Prova a leggere un FString (potenziale namespace)
+        if let Some(ns) = try_read_fstring_at(data, &mut off) {
+            // Namespace valido: non vuoto, non troppo lungo, sembra un path o nome
+            if ns.len() >= 2 && ns.len() <= 500 {
+                // Prova a leggere il count
+                if off + 4 <= data.len() {
+                    let count = i32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
+                    
+                    // Count ragionevole per una StringTable
+                    if (2..=50000).contains(&count) {
+                        let mut pairs_off = off + 4;
+                        let mut pairs: Vec<(String, String)> = Vec::new();
+                        let mut valid = true;
+                        
+                        for _ in 0..count {
+                            let saved = pairs_off;
+                            if let Some(key) = try_read_fstring_at(data, &mut pairs_off) {
+                                if let Some(val) = try_read_fstring_at(data, &mut pairs_off) {
+                                    // Key non vuota, value non vuota
+                                    if !key.is_empty() && !val.is_empty() {
+                                        pairs.push((key, val));
+                                    } else if key.is_empty() && val.is_empty() {
+                                        // Due stringhe vuote consecutive = probabilmente fine dati
+                                        valid = false;
+                                        break;
+                                    } else {
+                                        pairs.push((key, val));
+                                    }
+                                } else {
+                                    pairs_off = saved;
+                                    valid = false;
+                                    break;
+                                }
+                            } else {
+                                pairs_off = saved;
+                                valid = false;
+                                break;
+                            }
+                        }
+                        
+                        // Successo: abbiamo letto TUTTE le entry previste
+                        if valid && pairs.len() == count as usize && pairs.len() >= 2 {
+                            // Verifica che almeno alcune values siano testo leggibile (non binario)
+                            let readable = pairs.iter()
+                                .filter(|(_, v)| v.chars().any(|c| c.is_alphabetic()))
+                                .count();
+                            
+                            if readable >= pairs.len() / 2 {
+                                log::info!("📋 StringTable trovata! ns=\"{}\" count={} readable={}", 
+                                    &ns[..std::cmp::min(ns.len(), 60)], pairs.len(), readable);
+                                
+                                // Se è meglio del risultato precedente, usala
+                                if pairs.len() > best_result.len() {
+                                    best_result = pairs.iter()
+                                        .map(|(k, v)| (ns.clone(), k.clone(), v.clone()))
+                                        .collect();
+                                }
+                                
+                                // Salta oltre questa tabella e continua a cercare altre
+                                i = pairs_off;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        i += 1;
+    }
+    
+    best_result
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// UASSET STRING SCANNER (for DataTable localization)
+// ═══════════════════════════════════════════════════════════════════
+
+/// Scansiona byte raw di un .uasset per estrarre stringhe FString leggibili.
+/// Usato come fallback quando il gioco non ha .locres ma usa DataTable .uasset.
+fn scan_uasset_strings(data: &[u8], source_name: &str) -> Vec<super::unreal_localization::LocEntry> {
+    let mut raw_strings = Vec::new();
+    let mut i = 0usize;
+    
+    while i + 4 < data.len() {
+        let len = i32::from_le_bytes([data[i], data[i+1], data[i+2], data[i+3]]);
+        
+        if (3..=2000).contains(&len) {
+            let str_start = i + 4;
+            let str_end = str_start + (len as usize);
+            
+            if str_end <= data.len() {
+                let bytes = &data[str_start..str_end];
+                
+                if bytes[bytes.len() - 1] == 0 {
+                    let text_bytes = &bytes[..bytes.len() - 1];
+                    
+                    if let Ok(text) = std::str::from_utf8(text_bytes) {
+                        let trimmed = text.trim();
+                        if trimmed.len() >= 3 {
+                            raw_strings.push(trimmed.to_string());
+                            i = str_end;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        
+        i += 1;
+    }
+    
+    // Post-processing: pulisci e filtra
+    let mut entries = Vec::new();
+    let mut key_idx = 0u32;
+    let mut seen = std::collections::HashSet::new();
+    
+    for raw in &raw_strings {
+        for cleaned in clean_datatable_string(raw) {
+            let trimmed = cleaned.trim();
+            if trimmed.len() < 3 { continue; }
+            if !is_translatable_text(trimmed) { continue; }
+            if seen.contains(trimmed) { continue; }
+            
+            seen.insert(trimmed.to_string());
+            entries.push(super::unreal_localization::LocEntry {
+                namespace: source_name.to_string(),
+                key: format!("dt_{}_{}", source_name.replace('/', "_"), key_idx),
+                source_hash: 0,
+                value: trimmed.to_string(),
+            });
+            key_idx += 1;
+        }
+    }
+    
+    entries
+}
+
+/// Controlla se una stringa è testo traducibile (non un ID tecnico)
+fn is_translatable_text(s: &str) -> bool {
+    let alpha_count = s.chars().filter(|c| c.is_alphabetic()).count();
+    if alpha_count < 3 { return false; }
+    
+    // Escludi ID tecnici puri: TUTTO_MAIUSCOLO_CON_UNDERSCORE
+    if s.chars().all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit()) {
+        return false;
+    }
+    
+    // Escludi nomi interni CamelCase_WithUnderscores senza spazi
+    // Es: "LocalizationItemData", "SkillsNames_TEMP", "Chapt1_GameplayDialogs_Subs", "Generic_UI"
+    if !s.contains(' ') && s.contains('_') {
+        let parts: Vec<&str> = s.split('_').collect();
+        let all_camel = parts.iter().all(|p| {
+            p.is_empty() || p.chars().next().map(|c| c.is_ascii_uppercase() || c.is_ascii_digit()).unwrap_or(true)
+        });
+        if all_camel { return false; }
+    }
+    
+    // Escludi nomi CamelCase singoli senza spazi (es: "LocalizationItemData", "GameplayDialogs")
+    if !s.contains(' ') && !s.contains('_') && s.len() > 10 {
+        let transitions = s.as_bytes().windows(2)
+            .filter(|w| (w[0] as char).is_ascii_lowercase() && (w[1] as char).is_ascii_uppercase())
+            .count();
+        if transitions >= 2 { return false; }
+    }
+    
+    // Escludi path/reference
+    if s.contains("Content/") || s.starts_with('/') || s.contains("::") {
+        return false;
+    }
+    
+    // Escludi stringhe che iniziano con 0x (hex)
+    if s.starts_with("0x") { return false; }
+    
+    // Deve avere almeno uno spazio, punteggiatura, o essere un nome proprio breve
+    let has_space = s.contains(' ') || s.contains('.') || s.contains(',') 
+        || s.contains('!') || s.contains('?') || s.contains(':') || s.contains('-');
+    let is_short_name = s.len() <= 30 && s.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
+        && s.chars().any(|c| c.is_lowercase());
+    
+    has_space || is_short_name
+}
+
+/// Pulisce una stringa DataTable: separa ID tecnici concatenati dal testo
+fn clean_datatable_string(s: &str) -> Vec<String> {
+    let mut results = Vec::new();
+    
+    // Splitta su caratteri separatore non-ASCII/control (es. ␦ o altri)
+    let parts: Vec<&str> = s.split(|c: char| !c.is_ascii() && !c.is_alphanumeric() || c.is_control())
+        .filter(|p| !p.is_empty())
+        .collect();
+    
+    // Se la stringa originale non aveva separatori speciali, usa come singola parte
+    let work_parts = if parts.is_empty() { vec![s] } else { parts };
+    
+    for part in work_parts {
+        // Rimuovi prefissi ID tecnici: pattern XX_XX_... all'inizio
+        let cleaned = strip_id_prefix(part);
+        
+        // Splitta ulteriormente se ci sono più ID+testo concatenati
+        // Pattern: testo leggibileID_TECNICO_QUIaltro testo
+        let sub_parts = split_on_id_boundaries(cleaned);
+        
+        for sp in sub_parts {
+            let trimmed = sp.trim();
+            if !trimmed.is_empty() {
+                results.push(trimmed.to_string());
+            }
+        }
+    }
+    
+    if results.is_empty() {
+        results.push(s.to_string());
+    }
+    
+    results
+}
+
+/// Rimuove prefisso ID tecnico da una stringa.
+/// "GD_CH00_D13_L02_GAThanks to The Sun." → "Thanks to The Sun."
+/// "IT_TO_BOLDCUTTERSBolt cutters" → "Bolt cutters"
+fn strip_id_prefix(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut has_underscore = false;
+    
+    // Scansiona il prefisso: [A-Z0-9_]+
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_' {
+            if c == '_' { has_underscore = true; }
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    
+    // Se abbiamo trovato un prefisso di almeno 4 chars con almeno un underscore
+    // e il char successivo è una lettera maiuscola seguita da minuscola (inizio parola)
+    if i >= 4 && has_underscore && i < bytes.len() {
+        // Il prefisso potrebbe finire con lettere che fanno parte della parola successiva
+        // Es: "GAThanks" → "GA" è fine ID, "Thanks" è inizio testo
+        // Torna indietro finché troviamo la transizione uppercase→lowercase
+        let mut j = i;
+        while j > 0 && (bytes[j-1] as char).is_ascii_uppercase() {
+            j -= 1;
+        }
+        // j ora punta all'inizio della sequenza di uppercase alla fine del prefisso
+        // Se c'è almeno una uppercase prima di lowercase, quella è l'inizio della parola
+        if j < i && j > 2 {
+            return &s[j..];
+        }
+        return &s[i..];
+    }
+    
+    s
+}
+
+/// Splitta una stringa dove un ID tecnico appare nel mezzo del testo.
+/// "Bolt cuttersIT_TO_THANDLEWRENCH" → ["Bolt cutters"]
+/// "NearUI_SETTINGS_FOOBar" → ["Near", "Bar"]
+fn split_on_id_boundaries(s: &str) -> Vec<String> {
+    let mut results = Vec::new();
+    let chars: Vec<char> = s.chars().collect();
+    let mut segment_start = 0;
+    let mut i = 0;
+    
+    while i < chars.len() {
+        // Cerca inizio di un potenziale ID nel mezzo: [A-Z][A-Z0-9_]{3,}
+        if i > 0 && chars[i].is_ascii_uppercase() {
+            let id_start = i;
+            let mut j = i;
+            let mut underscores = 0;
+            while j < chars.len() && (chars[j].is_ascii_uppercase() || chars[j].is_ascii_digit() || chars[j] == '_') {
+                if chars[j] == '_' { underscores += 1; }
+                j += 1;
+            }
+            let id_len = j - id_start;
+            
+            // È un ID se ha 4+ chars E almeno un underscore
+            if id_len >= 4 && underscores >= 1 {
+                // Salva il testo prima dell'ID
+                if id_start > segment_start {
+                    let pre = &s[segment_start..id_start];
+                    let trimmed = pre.trim();
+                    if !trimmed.is_empty() {
+                        results.push(trimmed.to_string());
+                    }
+                }
+                
+                // Controlla se dopo l'ID c'è testo (uppercase+lowercase = inizio parola)
+                if j < chars.len() && chars[j].is_ascii_lowercase() && j > id_start + 1 {
+                    // L'ultima uppercase fa parte della parola
+                    let mut word_start = j - 1;
+                    while word_start > id_start && chars[word_start].is_ascii_uppercase() {
+                        word_start -= 1;
+                    }
+                    word_start += 1; // prima uppercase della parola
+                    segment_start = word_start;
+                } else {
+                    segment_start = j;
+                }
+                i = j;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    
+    // Aggiungi il segmento finale
+    if segment_start < s.len() {
+        let rest = s[segment_start..].trim();
+        if !rest.is_empty() {
+            results.push(rest.to_string());
+        }
+    }
+    
+    if results.is_empty() && !s.trim().is_empty() {
+        results.push(s.to_string());
+    }
+    
+    results
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// UCAS READER (with decompression)
+// ═══════════════════════════════════════════════════════════════════
+
+fn extract_file_from_ucas(
+    ucas_path: &Path,
+    toc_entry_index: usize,
+    offset_lengths: &[IoOffsetAndLength],
+    compressed_blocks: &[CompressedBlockEntry],
+    compression_methods: &[String],
+    block_size: u32,
+    oodle: &Option<OodleLib>,
+) -> Result<Vec<u8>, String> {
+    if toc_entry_index >= offset_lengths.len() {
+        return Err(format!("TocEntry index {} fuori range ({})", toc_entry_index, offset_lengths.len()));
+    }
+    
+    let oal = &offset_lengths[toc_entry_index];
+    let file_offset = oal.offset;
+    let file_length = oal.length;
+    
+    log::info!("📦 Estrazione file: offset={}, length={}", file_offset, file_length);
+    
+    // Trova i compressed blocks che contengono i dati di questo file
+    let bs = block_size as u64;
+    let first_block = (file_offset / bs) as usize;
+    let last_block = ((file_offset + file_length - 1) / bs) as usize;
+    
+    let mut output = Vec::with_capacity(file_length as usize);
+    
+    // Apri il file UCAS con seek (NON caricare tutto in RAM — può essere 14GB+)
+    use std::io::{Read, Seek, SeekFrom};
+    let mut ucas_file = std::fs::File::open(ucas_path)
+        .map_err(|e| format!("Errore apertura UCAS: {}", e))?;
+    
+    for block_idx in first_block..=last_block {
+        if block_idx >= compressed_blocks.len() {
+            return Err(format!("Block index {} fuori range ({})", block_idx, compressed_blocks.len()));
+        }
+        
+        let block = &compressed_blocks[block_idx];
+        let block_offset = block.offset;
+        let comp_size = block.compressed_size as usize;
+        let uncomp_size = block.uncompressed_size as usize;
+        
+        // Seek alla posizione del blocco e leggi solo i dati compressi
+        ucas_file.seek(SeekFrom::Start(block_offset))
+            .map_err(|e| format!("Seek UCAS failed @{}: {}", block_offset, e))?;
+        
+        let mut compressed_data = vec![0u8; comp_size];
+        ucas_file.read_exact(&mut compressed_data)
+            .map_err(|e| format!("Read UCAS block failed @{} ({}b): {}", block_offset, comp_size, e))?;
+        
+        let decompressed = if block.compression_method_index == 0 || comp_size == uncomp_size {
+            // Non compresso
+            compressed_data.to_vec()
+        } else {
+            // Determina metodo di compressione
+            let method_idx = (block.compression_method_index - 1) as usize;
+            let method_name = if method_idx < compression_methods.len() {
+                &compression_methods[method_idx]
+            } else {
+                "Unknown"
+            };
+            
+            match method_name.to_lowercase().as_str() {
+                "zlib" => {
+                    use std::io::Read;
+                    let mut decoder = flate2::read::ZlibDecoder::new(&compressed_data[..]);
+                    let mut buf = Vec::with_capacity(uncomp_size);
+                    decoder.read_to_end(&mut buf)
+                        .map_err(|e| format!("Zlib decompression failed: {}", e))?;
+                    buf
+                }
+                "lz4" => {
+                    lz4_flex::decompress(&compressed_data, uncomp_size)
+                        .map_err(|e| format!("LZ4 decompression failed: {}", e))?
+                }
+                name if name.contains("oodle") || name == "mermaid" || name == "kraken" || name == "leviathan" || name == "selkie" => {
+                    match oodle {
+                        Some(lib) => lib.decompress(&compressed_data, uncomp_size)?,
+                        None => return Err(format!(
+                            "Compressione {} richiede Oodle DLL (oo2core_9_win64.dll). Non trovata sul sistema.",
+                            method_name
+                        )),
+                    }
+                }
+                _ => {
+                    return Err(format!("Metodo compressione non supportato: {}", method_name));
+                }
+            }
+        };
+        
+        output.extend_from_slice(&decompressed);
+    }
+    
+    // Trim to actual file length (remove padding from last block)
+    let start_in_first_block = (file_offset % bs) as usize;
+    let actual_length = file_length as usize;
+    
+    if start_in_first_block > 0 || output.len() > actual_length {
+        let end = start_in_first_block + actual_length;
+        if end <= output.len() {
+            output = output[start_in_first_block..end].to_vec();
+        }
+    }
+    
+    Ok(output)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// FILESYSTEM HELPERS
+// ═══════════════════════════════════════════════════════════════════
+
+/// Trova file .utoc nella directory del gioco
+fn find_utoc_files(game_path: &Path) -> Vec<PathBuf> {
+    files_in_paks_dirs(game_path, "utoc")
+}
+
+/// File con una data estensione dentro OGNI directory `Paks` del gioco.
+///
+/// ⚠️ Non assumere una profondità fissa. Fino al 19/08/2026 qui si guardava
+/// esattamente `<gioco>/<sub>/Content/Paks`: su The Skin Stapler il percorso
+/// vero è `<gioco>/TheSkinStapler/TheSkinStapler/Content/Paks` (due livelli) e
+/// la ricerca tornava vuota, quindi `extract_iostore_localization` usciva
+/// subito con «Nessun file .utoc trovato» e il fallback sui .pak — che
+/// funziona — non veniva mai raggiunto. Il gioco ha 1007 stringhe.
+fn files_in_paks_dirs(game_path: &Path, ext: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for dir in super::unreal_localization::find_all_paks_dirs(game_path) {
+        if let Ok(entries) = fs::read_dir(&dir) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.extension().map(|x| x == ext).unwrap_or(false) {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Trova i .pak "originali" del gioco (esclude i nostri override _P.pak).
+fn find_pak_files(game_path: &Path) -> Vec<PathBuf> {
+    files_in_paks_dirs(game_path, "pak")
+        .into_iter()
+        .filter(|p| {
+            let name = p.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+            // salta i nostri override e le patch _P
+            !name.contains("gamestringer") && !name.ends_with("_p.pak")
+        })
+        .collect()
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// TAURI COMMANDS
+// ═══════════════════════════════════════════════════════════════════
+
+/// Estrae stringhe di localizzazione da un container IoStore (UTOC/UCAS)
+#[tauri::command]
+pub async fn extract_iostore_localization(game_path: String) -> Result<ExtractionResult, String> {
+    let game_dir = Path::new(&game_path);
+    
+    if !game_dir.exists() {
+        return Err(format!("Directory non trovata: {}", game_path));
+    }
+    
+    log::info!("🔍 IoStore extraction da: {}", game_path);
+    
+    // Trova file .utoc
+    let utoc_files = find_utoc_files(game_dir);
+    if utoc_files.is_empty() {
+        return Err("Nessun file .utoc trovato".into());
+    }
+    
+    // Carica Oodle. Se manca NON si esce subito: i blocchi non compressi
+    // restano leggibili. Ma il fatto va tracciato, perché sui giochi reali è
+    // la causa dominante di "0 stringhe" (misurato il 29/07/2026: 2,6–6,4%
+    // di blocchi in chiaro, e i file alla portata sono enum e material
+    // function — 0,13 stringhe/file). Un tempo questo warning moriva nel log
+    // e l'utente non poteva distinguere "il gioco non ha testo" da "non ho
+    // potuto aprire niente".
+    let oodle = match OodleLib::load() {
+        Ok(lib) => {
+            log::info!("✅ Oodle caricata con successo");
+            Some(lib)
+        }
+        Err(e) => {
+            log::warn!("⚠️ Oodle non disponibile: {}", e);
+            None
+        }
+    };
+    // Quanti container dichiarano Oodle fra i metodi di compressione.
+    let mut contenitori_oodle = 0usize;
+    
+    // Contesto per fallback .uasset DataTable
+    struct LocAssetCtx {
+        file: IoStoreFile,
+        utoc_idx: usize,
+    }
+    let mut loc_asset_contexts: Vec<LocAssetCtx> = Vec::new();
+    // TUTTI i .locres trovati, con l'indice del container per estrarli dopo il
+    // loop. Prima si ritornava al PRIMO .locres del PRIMO container: sul gioco di collaudo
+    // usciva un file di plugin (OnlineError, 12 voci) invece del Game.locres
+    // (752). Ora si raccoglie tutto e si sceglie/aggrega dopo.
+    let mut locres_candidates: Vec<(usize, IoStoreFile)> = Vec::new();
+    let mut utoc_contexts: Vec<(
+        PathBuf, // ucas_path
+        UtocHeader,
+        Vec<IoOffsetAndLength>,
+        Vec<CompressedBlockEntry>,
+        Vec<String>, // compression_methods
+        Vec<u8>,     // raw utoc_data (for ChunkID reading)
+    )> = Vec::new();
+    
+    for utoc_path in &utoc_files {
+        let utoc_name = utoc_path.file_name().unwrap_or_default().to_string_lossy();
+        log::info!("📦 Analisi UTOC: {}", utoc_path.display());
+        
+        // Corrispondente .ucas
+        let ucas_path = utoc_path.with_extension("ucas");
+        if !ucas_path.exists() {
+            log::warn!("⚠️ UCAS non trovato: {}", ucas_path.display());
+            continue;
+        }
+        
+        // Leggi e parsa UTOC (errori singoli non bloccano il loop)
+        let utoc_data = match fs::read(utoc_path) {
+            Ok(d) => d,
+            Err(e) => {
+                log::warn!("⚠️ Errore lettura UTOC {}: {}", utoc_name, e);
+                continue;
+            }
+        };
+        
+        let header = match parse_utoc_header(&utoc_data) {
+            Ok(h) => h,
+            Err(e) => {
+                log::warn!("⚠️ Header invalido in {}: {}", utoc_name, e);
+                continue;
+            }
+        };
+        let (offset_lengths, compressed_blocks, compression_methods, files) =
+            match parse_utoc_data(&utoc_data, &header) {
+                Ok(r) => r,
+                Err(e) => {
+                    log::warn!("⚠️ Errore parsing dati {}: {}", utoc_name, e);
+                    continue;
+                }
+            };
+        if compression_methods.iter().any(|m| m.to_lowercase().contains("oodle")) {
+            contenitori_oodle += 1;
+        }
+        
+        // Cerca file .locres
+        let locres_files: Vec<&IoStoreFile> = files.iter()
+            .filter(|f| f.path.ends_with(".locres"))
+            .collect();
+
+        // Se ci sono .locres: RACCOGLILI, non estrarre-e-ritornare qui. Il
+        // Game.locres (i dialoghi) può stare in un container più avanti, e
+        // fermarsi al primo faceva vincere un .locres di plugin.
+        if !locres_files.is_empty() {
+            log::info!("📝 Trovati {} file .locres in {}", locres_files.len(), utoc_name);
+            let ctx_idx = utoc_contexts.len();
+            utoc_contexts.push((ucas_path.clone(), header, offset_lengths, compressed_blocks, compression_methods, utoc_data));
+            for f in &locres_files {
+                log::info!("  📄 {} (entry {})", f.path, f.toc_entry_index);
+                locres_candidates.push((ctx_idx, (*f).clone()));
+            }
+            continue;
+        }
+
+        // Nessun .locres: cerca .uasset di localizzazione come fallback
+        let loc_assets: Vec<_> = files.iter()
+            .filter(|f| {
+                let p = f.path.to_lowercase();
+                (p.contains("localization") || p.contains("localiz"))
+                    && f.path.ends_with(".uasset")
+            })
+            .collect();
+        if !loc_assets.is_empty() {
+            log::info!("📦 {} .uasset di localizzazione trovati in {} (no .locres)", loc_assets.len(), utoc_name);
+            let ctx_idx = utoc_contexts.len();
+            utoc_contexts.push((ucas_path.clone(), header, offset_lengths, compressed_blocks, compression_methods, utoc_data));
+            for a in &loc_assets {
+                loc_asset_contexts.push(LocAssetCtx {
+                    file: (*a).clone(),
+                    utoc_idx: ctx_idx,
+                });
+            }
+        } else {
+            log::info!("📦 Nessun .locres né .uasset localization in {}", utoc_name);
+        }
+        continue;
+    }
+
+    // ── Scelta e AGGREGAZIONE dei .locres raccolti da tutti i container ──────
+    // Obiettivo: i dialoghi del gioco (Game.locres), non i .locres di plugin.
+    if !locres_candidates.is_empty() {
+        let is_engine = |p: &str| {
+            let l = p.to_lowercase();
+            l.contains("engine/") || l.contains("engine\\")
+                || l.contains("/plugins/") || l.contains("\\plugins\\")
+        };
+        // 1) preferisci i .locres NON di motore/plugin (i dialoghi stanno lì);
+        //    se non ne restano, ripiega su tutti.
+        let non_engine: Vec<_> = locres_candidates.iter().filter(|(_, f)| !is_engine(&f.path)).cloned().collect();
+        let pool = if non_engine.is_empty() { locres_candidates.clone() } else { non_engine };
+        // 2) una sola cultura: preferisci /en/ (il gioco è in inglese di base),
+        //    così non si mescolano lingue diverse dello stesso testo.
+        let is_en = |p: &str| { let l = p.to_lowercase(); l.contains("/en/") || l.contains("\\en\\") || l.ends_with("/en") };
+        let has_en = pool.iter().any(|(_, f)| is_en(&f.path));
+        let chosen: Vec<_> = if has_en {
+            pool.iter().filter(|(_, f)| is_en(&f.path)).cloned().collect()
+        } else {
+            pool
+        };
+
+        // 3) estrai e AGGREGA tutti i .locres scelti, deduplicando (namespace,key).
+        let mut all_entries: Vec<super::unreal_localization::LocEntry> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut chosen_paths: Vec<String> = Vec::new();
+        let mut version_seen: Option<u8> = None;
+
+        for (ctx_idx, f) in &chosen {
+            let (ref ucas_p, ref hdr, ref offs, ref blks, ref meths, _) = utoc_contexts[*ctx_idx];
+            let data = match extract_file_from_ucas(
+                ucas_p, f.toc_entry_index as usize, offs, blks, meths, hdr.compression_block_size, &oodle,
+            ) {
+                Ok(d) => d,
+                Err(e) => { log::warn!("⚠️ estrazione .locres {} fallita: {}", f.path, e); continue; }
+            };
+            match super::unreal_localization::parse_locres_pub(&data) {
+                Ok((version, entries)) => {
+                    version_seen = Some(version);
+                    let before = all_entries.len();
+                    for e in entries {
+                        if seen.insert((e.namespace.clone(), e.key.clone())) {
+                            all_entries.push(e);
+                        }
+                    }
+                    log::info!("📝 {} → +{} stringhe (v{}, {} byte)", f.path, all_entries.len() - before, version, data.len());
+                    chosen_paths.push(f.path.clone());
+                }
+                Err(e) => log::warn!("⚠️ parsing .locres {} fallito: {}", f.path, e),
+            }
+        }
+
+        if !all_entries.is_empty() {
+            let count = all_entries.len();
+            let ver = version_seen.unwrap_or(0);
+            log::info!("✅ IoStore: {} stringhe aggregate da {} .locres", count, chosen_paths.len());
+            return Ok(ExtractionResult {
+                success: true,
+                entries: all_entries,
+                source_file: game_path.clone(),
+                pak_version: 0,
+                locres_path: chosen_paths.join(", "),
+                message: format!(
+                    "Estratte {} stringhe da {} file .locres IoStore (LocRes v{})",
+                    count, chosen_paths.len(), ver
+                ),
+            });
+        }
+        log::warn!("⚠️ {} .locres candidati ma nessuna stringa estratta (Oodle?)", locres_candidates.len());
+    }
+
+    // Un pak chiuso a chiave non e' un gioco senza testo, ma non e' nemmeno
+    // detto che sia l'ultima parola: il fallback .uasset piu' sotto puo' ancora
+    // trovare stringhe. Percio' si prende nota qui e si decide alla fine.
+    let mut serve_chiave = false;
+    let mut chiave_sbagliata = false;
+
+    // ── Se l'IoStore non ha .locres, cercali nei .pak classici del gioco ────
+    // (alcuni giochi tengono il Game.locres nel .pak classico, compresso Oodle.)
+    {
+        let pak_files = find_pak_files(game_dir);
+        if !pak_files.is_empty() {
+            log::info!("📦 Cerco .locres in {} .pak classici", pak_files.len());
+            let is_engine = |p: &str| { let l = p.to_lowercase(); l.contains("engine/") || l.contains("engine\\") || l.contains("/plugins/") || l.contains("\\plugins\\") };
+            let is_en = |p: &str| { let l = p.to_lowercase(); l.contains("/en/") || l.contains("\\en\\") };
+            let mut all_entries: Vec<super::unreal_localization::LocEntry> = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            let mut chosen_paths: Vec<String> = Vec::new();
+            let mut version_seen: Option<u8> = None;
+
+            for pak in &pak_files {
+                let locres_list = match extract_locres_from_pak_for_game(pak, &oodle, Some(&game_path)) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        // «Serve la chiave» non è un pak illeggibile: va riportato
+                        // all'utente, non sepolto in un warning. Si continua però
+                        // il giro, perché un altro pak potrebbe non essere cifrato.
+                        if e.contains(PAK_NEEDS_AES) { serve_chiave = true; }
+                        else if e.contains(PAK_WRONG_AES) { chiave_sbagliata = true; }
+                        log::warn!("⚠️ pak {}: {}", pak.display(), e);
+                        continue;
+                    }
+                };
+                let non_engine: Vec<_> = locres_list.iter().filter(|l| !is_engine(&l.path)).collect();
+                let pool = if non_engine.is_empty() { locres_list.iter().collect::<Vec<_>>() } else { non_engine };
+                let has_en = pool.iter().any(|l| is_en(&l.path));
+                for l in pool {
+                    if has_en && !is_en(&l.path) { continue; }
+                    match super::unreal_localization::parse_locres_pub(&l.data) {
+                        Ok((ver, entries)) => {
+                            version_seen = Some(ver);
+                            let before = all_entries.len();
+                            for e in entries {
+                                if seen.insert((e.namespace.clone(), e.key.clone())) {
+                                    all_entries.push(e);
+                                }
+                            }
+                            if all_entries.len() > before {
+                                log::info!("📝 {} → +{} stringhe (v{})", l.path, all_entries.len() - before, ver);
+                                chosen_paths.push(l.path.clone());
+                            }
+                        }
+                        Err(e) => log::warn!("⚠️ parse .locres {} fallito: {}", l.path, e),
+                    }
+                }
+            }
+
+            if !all_entries.is_empty() {
+                let count = all_entries.len();
+                let ver = version_seen.unwrap_or(0);
+                log::info!("✅ PAK: {} stringhe aggregate da {} .locres", count, chosen_paths.len());
+                return Ok(ExtractionResult {
+                    success: true,
+                    entries: all_entries,
+                    source_file: game_path.clone(),
+                    pak_version: 0,
+                    locres_path: chosen_paths.join(", "),
+                    message: format!("Estratte {} stringhe da {} .locres nel .pak (LocRes v{})", count, chosen_paths.len(), ver),
+                });
+            }
+        }
+    }
+
+    // Fallback: estrai stringhe dai .uasset di localizzazione
+    let esito: Result<ExtractionResult, String> = if !loc_asset_contexts.is_empty() {
+        log::info!("📦 Fallback .uasset: analisi {} file di localizzazione", loc_asset_contexts.len());
+        
+        let mut stringtable_entries = Vec::new();
+        let mut ftext_entries = Vec::new();
+        let mut heuristic_entries = Vec::new();
+        let mut extract_err_count = 0u32;
+        let mut seen_st = std::collections::HashSet::new();
+        let mut seen_ftext = std::collections::HashSet::new();
+        
+        let mut chunk_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        
+        for ctx in &loc_asset_contexts {
+            let (ref ucas_path, ref hdr, ref offsets, ref blocks, ref methods, ref utoc_raw) = utoc_contexts[ctx.utoc_idx];
+            
+            // Leggi ChunkID (12 bytes) dal raw UTOC
+            let chunk_id_offset = hdr.header_size as usize + ctx.file.toc_entry_index as usize * 12;
+            if chunk_id_offset + 12 <= utoc_raw.len() {
+                let chunk_id_hex = utoc_raw[chunk_id_offset..chunk_id_offset + 12]
+                    .iter().map(|b| format!("{:02x}", b)).collect::<String>();
+                let safe_name = ctx.file.path.replace(['/', '\\'], "_");
+                chunk_map.insert(safe_name, chunk_id_hex.clone());
+                log::info!("🔑 ChunkID per {}: {}", ctx.file.path, chunk_id_hex);
+            }
+            
+            log::info!("📦 Estrazione .uasset: {} (entry {})", ctx.file.path, ctx.file.toc_entry_index);
+            
+            match extract_file_from_ucas(
+                ucas_path,
+                ctx.file.toc_entry_index as usize,
+                offsets,
+                blocks,
+                methods,
+                hdr.compression_block_size,
+                &oodle,
+            ) {
+                Ok(uasset_data) => {
+                    // 0) Prova StringTable parser (namespace/key/value reali per .locres)
+                    let st_entries = scan_stringtable_entries(&uasset_data);
+                    if !st_entries.is_empty() {
+                        log::info!("📋 StringTable: {} entry trovate in {}", st_entries.len(), ctx.file.path);
+                        for (idx, (ns, key, val)) in st_entries.iter().enumerate().take(3) {
+                            log::info!("  📋 [{}] ns=\"{}\" key=\"{}\" val=\"{}\"", idx, ns, key,
+                                &val[..std::cmp::min(60, val.len())]);
+                        }
+                        for (ns, key, val) in st_entries {
+                            let dedup_key = format!("{}::{}", ns, key);
+                            if !seen_st.contains(&dedup_key) && !val.is_empty() {
+                                seen_st.insert(dedup_key);
+                                stringtable_entries.push(super::unreal_localization::LocEntry {
+                                    namespace: ns,
+                                    key,
+                                    source_hash: 0,
+                                    value: val,
+                                });
+                            }
+                        }
+                    }
+                    
+                    // 1) Prova FText scanner (namespace/key reali per .locres)
+                    let ftexts = scan_ftext_entries(&uasset_data);
+                    if !ftexts.is_empty() {
+                        log::info!("✨ FText: {} entry trovate in {}", ftexts.len(), ctx.file.path);
+                        for (ns, key, src) in &ftexts {
+                            log::debug!("  FText: ns={} key={} src={}", ns, key, &src[..std::cmp::min(60, src.len())]);
+                        }
+                        // Log primi 3 per debug
+                        for (idx, (ns, key, src)) in ftexts.iter().enumerate().take(3) {
+                            log::info!("  📝 [{}] ns=\"{}\" key=\"{}\" text=\"{}\"", idx, ns, key, 
+                                &src[..std::cmp::min(80, src.len())]);
+                        }
+                        
+                        for (ns, key, src) in ftexts {
+                            let dedup_key = format!("{}::{}", ns, key);
+                            if !seen_ftext.contains(&dedup_key) && src.len() >= 2 {
+                                seen_ftext.insert(dedup_key);
+                                ftext_entries.push(super::unreal_localization::LocEntry {
+                                    namespace: ns,
+                                    key,
+                                    source_hash: 0,
+                                    value: src,
+                                });
+                            }
+                        }
+                    }
+                    
+                    // 2) Fallback: scan euristico FString (per binary patching)
+                    let source = &ctx.file.path;
+                    let strings = scan_uasset_strings(&uasset_data, source);
+                    log::info!("📦 Heuristic: {} stringhe leggibili in {}", strings.len(), ctx.file.path);
+                    
+                    // Cache .uasset raw (serve per binary patching se FText non funziona)
+                    let cache_dir = game_dir.join("GameStringer").join("uasset_cache");
+                    let _ = fs::create_dir_all(&cache_dir);
+                    let safe_name = ctx.file.path.replace(['/', '\\'], "_");
+                    let cache_path = cache_dir.join(&safe_name);
+                    let _ = fs::write(&cache_path, &uasset_data);
+                    
+                    heuristic_entries.extend(strings);
+                }
+                Err(e) => {
+                    log::warn!("⚠️ Errore estrazione {}: {}", ctx.file.path, e);
+                    extract_err_count += 1;
+                }
+            }
+        }
+        
+        // Salva chunk_map.json con metadata UTOC per IoStore writer
+        if !chunk_map.is_empty() {
+            let cache_dir = game_dir.join("GameStringer").join("uasset_cache");
+            let _ = fs::create_dir_all(&cache_dir);
+            let map_path = cache_dir.join("chunk_map.json");
+            
+            // Prendi metadata dal primo UTOC context
+            let (utoc_ver, hdr_size, blk_size, cont_id) = if let Some((_, ref h, _, _, _, _)) = utoc_contexts.first() {
+                (h.version as u32, h.header_size, h.compression_block_size, h.container_id)
+            } else {
+                (3u32, 144u32, 65536u32, 0u64)
+            };
+            
+            let mut meta_map = serde_json::Map::new();
+            meta_map.insert("utoc_version".into(), serde_json::Value::Number(utoc_ver.into()));
+            meta_map.insert("header_size".into(), serde_json::Value::Number(hdr_size.into()));
+            meta_map.insert("block_size".into(), serde_json::Value::Number(blk_size.into()));
+            meta_map.insert("container_id".into(), serde_json::Value::Number(cont_id.into()));
+            
+            let mut root = serde_json::Map::new();
+            root.insert("__meta".into(), serde_json::Value::Object(meta_map));
+            for (k, v) in &chunk_map {
+                root.insert(k.clone(), serde_json::Value::String(v.clone()));
+            }
+            
+            match serde_json::to_string_pretty(&serde_json::Value::Object(root)) {
+                Ok(json) => {
+                    let _ = fs::write(&map_path, &json);
+                    log::info!("💾 Chunk map salvato: {} ({} file, UTOC v{}, block={})", 
+                        map_path.display(), chunk_map.len(), utoc_ver, blk_size);
+                }
+                Err(e) => log::warn!("⚠️ Errore serializzazione chunk_map: {}", e),
+            }
+        }
+        
+        // PRIORITÀ 1: StringTable entries (namespace/key/value reali dal parser StringTable)
+        if !stringtable_entries.is_empty() {
+            let count = stringtable_entries.len();
+            log::info!("📋 Usando {} entry StringTable per .locres (nessun vincolo dimensione)", count);
+            return Ok(ExtractionResult {
+                success: true,
+                entries: stringtable_entries,
+                source_file: "IoStore DataTable".to_string(),
+                pak_version: 0,
+                locres_path: "StringTable .locres".to_string(),
+                message: format!(
+                    "Estratte {} stringhe StringTable da {} .uasset (con namespace/key per .locres)",
+                    count, loc_asset_contexts.len()
+                ),
+            });
+        }
+        
+        // PRIORITÀ 2: FText entries (namespace/key reali per .locres)
+        if !ftext_entries.is_empty() {
+            let count = ftext_entries.len();
+            log::info!("✨ Usando {} entry FText per .locres (nessun vincolo dimensione, {} euristiche scartate)", 
+                count, heuristic_entries.len());
+            return Ok(ExtractionResult {
+                success: true,
+                entries: ftext_entries,
+                source_file: "IoStore DataTable".to_string(),
+                pak_version: 0,
+                locres_path: "FText .locres".to_string(),
+                message: format!(
+                    "Estratte {} stringhe FText da {} .uasset (con namespace/key per .locres)",
+                    count, loc_asset_contexts.len()
+                ),
+            });
+        }
+        
+        // PRIORITÀ 3: heuristic entries → IoStore binary patching (vincolo same-size)
+        if !heuristic_entries.is_empty() {
+            let count = heuristic_entries.len();
+            log::info!("📦 Fallback: usando {} entry euristiche (binary patching, no FText)", count);
+            return Ok(ExtractionResult {
+                success: true,
+                entries: heuristic_entries,
+                source_file: "IoStore DataTable".to_string(),
+                pak_version: 0,
+                locres_path: "DataTable .uasset".to_string(),
+                message: format!(
+                    "Estratte {} stringhe da {} .uasset DataTable (no .locres, no FText)",
+                    count, loc_asset_contexts.len()
+                ),
+            });
+        }
+        
+        // Diagnosi PRECISA, non generica: se Oodle manca e i container la
+        // usano, gli errori di estrazione sono quasi certamente quello — e
+        // dirlo cambia cosa l'utente può fare (procurarsi la DLL) rispetto a
+        // un "errori estrazione" che non dà appigli.
+        if oodle.is_none() && contenitori_oodle > 0 {
+            Err(format!(
+                "OODLE_MANCANTE: {} .uasset di localizzazione trovati ma i container \
+                 sono compressi con Oodle e la DLL (oo2core_*_win64.dll) non è sul PC. \
+                 Senza, i file compressi non si aprono ({} errori). La DLL è inclusa \
+                 in molti giochi UE4 e in Unreal Engine; copiala in \
+                 %APPDATA%/GameStringer/tools/",
+                loc_asset_contexts.len(), extract_err_count
+            ))
+        } else {
+            Err(format!(
+                "Trovati {} .uasset localizzazione, {} errori estrazione",
+                loc_asset_contexts.len(), extract_err_count
+            ))
+        }
+    } else if contenitori_oodle > 0 && oodle.is_none() {
+        // Il caso misurato sui giochi veri (29/07/2026): niente .locres, testi
+        // dentro i .uasset, e senza Oodle non possiamo nemmeno guardarci dentro.
+        Err(
+            "OODLE_MANCANTE: questo gioco non ha file .locres (non usa la \
+             localizzazione di Unreal: i testi stanno nei .uasset) e i container \
+             sono compressi con Oodle, ma la DLL (oo2core_*_win64.dll) non è sul \
+             PC. Senza, i .uasset non si possono esaminare. La DLL è inclusa in \
+             molti giochi UE4 e in Unreal Engine; copiala in \
+             %APPDATA%/GameStringer/tools/"
+            .into(),
+        )
+    } else {
+        Err(
+            "Nessun file .locres nei container IoStore: il gioco non usa la \
+             localizzazione di Unreal e nei .uasset non sono stati trovati asset \
+             di localizzazione riconoscibili"
+            .into(),
+        )
+    };
+
+    // Solo ora si puo' dire perche' non e' uscito niente. Se un pak era chiuso a
+    // chiave quello e' il motivo vero, e l'utente puo' farci qualcosa; il
+    // messaggio generico «non usa la localizzazione di Unreal» lo manderebbe a
+    // cercare un problema che non ha.
+    match esito {
+        Ok(r) => Ok(r),
+        Err(_) if serve_chiave => Err(PAK_NEEDS_AES.to_string()),
+        Err(_) if chiave_sbagliata => Err(PAK_WRONG_AES.to_string()),
+        Err(e) => Err(e),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// BINARY PATCHING for DataTable .uasset
+// ═══════════════════════════════════════════════════════════════════
+
+/// Cerca SerialSize + SerialOffset nell'export table del .uasset.
+/// Restituisce (offset_del_campo_serial_size, serial_size, serial_offset).
+fn find_serial_size_in_header(data: &[u8]) -> Option<(usize, i64, i64)> {
+    let file_size = data.len() as i64;
+    // L'export table è nella prima metà del file (header area)
+    let search_end = data.len() / 2;
+    
+    for i in 0..search_end.saturating_sub(16) {
+        if i + 16 > data.len() { break; }
+        let serial_size = i64::from_le_bytes([
+            data[i], data[i+1], data[i+2], data[i+3],
+            data[i+4], data[i+5], data[i+6], data[i+7],
+        ]);
+        let serial_offset = i64::from_le_bytes([
+            data[i+8], data[i+9], data[i+10], data[i+11],
+            data[i+12], data[i+13], data[i+14], data[i+15],
+        ]);
+        
+        // SerialOffset = header size (dove iniziano i dati export)
+        // SerialSize + SerialOffset == file_size
+        if serial_offset > 100 && serial_offset < file_size / 2
+            && serial_size > 0 && serial_size < file_size
+            && serial_size + serial_offset == file_size
+        {
+            return Some((i, serial_size, serial_offset));
+        }
+    }
+    None
+}
+
+/// Trova TotalHeaderSize dal header UAsset per sapere dove inizia la sezione dati.
+/// Il Name Map, Import/Export tables etc. sono PRIMA di TotalHeaderSize e NON devono
+/// essere patchati — contengono nomi di classi, proprietà, path degli asset.
+fn find_uasset_data_offset(data: &[u8]) -> usize {
+    if data.len() < 28 { return 0; }
+    
+    // Tag UAsset: 0x9E2A83C1 (little-endian)
+    let tag = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+    if tag != 0x9E2A83C1 {
+        log::warn!("⚠️ UAsset magic non trovato, patching intero file");
+        return 0;
+    }
+    
+    let legacy_ver = i32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+    let mut off = 8usize;
+    
+    // LegacyUE3Version (sempre presente tranne -4, ma in pratica sempre c'è)
+    if legacy_ver != -4 { off += 4; }
+    
+    // FileVersionUE4
+    off += 4;
+    
+    // FileVersionUE5 (solo se LegacyFileVersion <= -8, cioè UE5+)
+    if legacy_ver <= -8 { off += 4; }
+    
+    // FileVersionLicenseeUE
+    off += 4;
+    
+    // CustomVersions: count (i32) + entries (20 bytes each: 16 GUID + 4 version)
+    if off + 4 > data.len() { return 0; }
+    let cv_count = i32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
+    off += 4;
+    if cv_count > 0 && cv_count < 500 {
+        off += (cv_count as usize) * 20;
+    }
+    
+    // TotalHeaderSize (i32)
+    if off + 4 > data.len() { return 0; }
+    let total_header_size = i32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
+    
+    if total_header_size > 0 && (total_header_size as usize) <= data.len() {
+        log::info!("📐 UAsset header size: {} bytes (data starts at offset {}), LegacyVer={}, CustomVersions={}", 
+            total_header_size, total_header_size, legacy_ver, cv_count);
+        total_header_size as usize
+    } else {
+        log::warn!("⚠️ TotalHeaderSize invalido: {}, patching intero file", total_header_size);
+        0
+    }
+}
+
+/// Patcha un .uasset binario sostituendo le FString originali con le traduzioni.
+/// SICUREZZA: salta l'header UAsset (Name Map, Import/Export tables) per evitare
+/// di corrompere i dati strutturali. Patcha SOLO la sezione dati serializzati.
+/// Le FString vengono sostituite con la lunghezza corretta (length prefix aggiornato).
+/// La dimensione del file può cambiare — il container IoStore registrerà la nuova size.
+/// Dopo il patching, aggiorna SerialSize nell'export table per riflettere la nuova dimensione.
+fn patch_uasset_binary(data: &[u8], replacements: &std::collections::HashMap<String, String>) -> Vec<u8> {
+    let mut result = Vec::with_capacity(data.len() + data.len() / 4);
+    let mut patch_count = 0u32;
+    let mut grown_count = 0u32;
+    
+    // Trova dove inizia la sezione dati (dopo header strutturale)
+    let data_offset = find_uasset_data_offset(data);
+    
+    // Copia header verbatim (Name Map, Import/Export tables, etc.)
+    result.extend_from_slice(&data[..data_offset]);
+    
+    let mut i = data_offset;
+    
+    while i < data.len() {
+        if i + 4 < data.len() {
+            let len = i32::from_le_bytes([data[i], data[i+1], data[i+2], data[i+3]]);
+            
+            // FString valida: lunghezza ragionevole (min 3 chars)
+            if (3..=2000).contains(&len) {
+                let str_start = i + 4;
+                let str_end = str_start + (len as usize);
+                
+                if str_end <= data.len() && data[str_end - 1] == 0 {
+                    let text_bytes = &data[str_start..str_end - 1];
+                    
+                    if let Ok(text) = std::str::from_utf8(text_bytes) {
+                        let trimmed = text.trim();
+                        
+                        // Salta stringhe che sembrano path/classi/proprietà UE
+                        let is_structural = trimmed.contains('/')
+                            || trimmed.contains('\\')
+                            || trimmed.contains("::")
+                            || trimmed.starts_with('/');
+                        
+                        if !is_structural {
+                            // Match diretto (testo identico)
+                            if let Some(translated) = replacements.get(trimmed) {
+                                let new_bytes = translated.as_bytes();
+                                let new_len = (new_bytes.len() + 1) as i32; // +1 per null terminator
+                                
+                                if new_bytes.len() > text_bytes.len() {
+                                    grown_count += 1;
+                                }
+                                
+                                // Scrivi nuovo length prefix e nuova stringa
+                                result.extend_from_slice(&new_len.to_le_bytes());
+                                result.extend_from_slice(new_bytes);
+                                result.push(0); // null terminator
+                                
+                                i = str_end;
+                                patch_count += 1;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        result.push(data[i]);
+        i += 1;
+    }
+    
+    let size_delta = result.len() as i64 - data.len() as i64;
+    
+    // Aggiorna SerialSize nell'export table se la dimensione è cambiata.
+    // IMPORTANTE: cerchiamo nei dati ORIGINALI dove serial_size + serial_offset == data.len(),
+    // poi aggiorniamo il campo alla stessa posizione nel result (l'header è copiato verbatim).
+    if size_delta != 0 {
+        if let Some((ss_offset, old_serial_size, _serial_offset)) = find_serial_size_in_header(data) {
+            let new_serial_size = old_serial_size + size_delta;
+            if new_serial_size > 0 && ss_offset + 8 <= result.len() {
+                let new_ss_bytes = new_serial_size.to_le_bytes();
+                result[ss_offset..ss_offset + 8].copy_from_slice(&new_ss_bytes);
+                log::info!("📐 SerialSize aggiornata: {} → {} (delta={}, offset_field={})", 
+                    old_serial_size, new_serial_size, size_delta, ss_offset);
+            }
+        } else {
+            log::warn!("⚠️ SerialSize non trovata nell'header — il file potrebbe non funzionare (delta={})", size_delta);
+        }
+    }
+    
+    if grown_count > 0 {
+        log::info!("📏 {} stringhe cresciute (traduzione più lunga dell'originale), delta totale: {} bytes", 
+            grown_count, size_delta);
+    }
+    log::info!("🔧 Patchate {} stringhe (sezione dati, offset {}+), size: {} → {} bytes (delta={})", 
+        patch_count, data_offset, data.len(), result.len(), size_delta);
+    
+    result
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// CITYHASH64 (per ContainerId UE5)
+// ═══════════════════════════════════════════════════════════════════
+
+/// CityHash64 (Google, v1.0.3) — usato da UE5 per calcolare FIoContainerId.
+/// Input: raw bytes del nome container come UTF-16LE.
+fn city_hash_64(data: &[u8]) -> u64 {
+    const K0: u64 = 0xc3a5c85c97cb3127;
+    const K1: u64 = 0xb492b66fbe98f273;
+    const K2: u64 = 0x9ae16a3b2f90404f;
+
+    #[inline] fn f64(s: &[u8], i: usize) -> u64 { s.get(i..i+8).and_then(|b| b.try_into().ok()).map(u64::from_le_bytes).unwrap_or(0) }
+    #[inline] fn f32(s: &[u8], i: usize) -> u64 { s.get(i..i+4).and_then(|b| b.try_into().ok()).map(u32::from_le_bytes).unwrap_or(0) as u64 }
+    #[inline] fn rot(v: u64, s: u32) -> u64 { if s == 0 { v } else { (v >> s) | (v << (64 - s)) } }
+    #[inline] fn smix(v: u64) -> u64 { v ^ (v >> 47) }
+    #[inline] fn h16(u: u64, v: u64, mul: u64) -> u64 {
+        let a = (u ^ v).wrapping_mul(mul); let a = a ^ (a >> 47);
+        let b = (v ^ a).wrapping_mul(mul); let b = b ^ (b >> 47);
+        b.wrapping_mul(mul)
+    }
+
+    let n = data.len();
+    if n <= 16 {
+        if n >= 8 {
+            let mul = K2.wrapping_add((n as u64) * 2);
+            let a = f64(data, 0).wrapping_add(K2);
+            let b = f64(data, n - 8);
+            return h16(rot(b, 37).wrapping_mul(mul).wrapping_add(a),
+                       (rot(a, 25).wrapping_add(b)).wrapping_mul(mul), mul);
+        }
+        if n >= 4 {
+            let mul = K2.wrapping_add((n as u64) * 2);
+            return h16((n as u64).wrapping_add(f32(data, 0) << 3), f32(data, n - 4), mul);
+        }
+        if n > 0 {
+            let y = (data[0] as u64).wrapping_add((data[n >> 1] as u64) << 8);
+            let z = (n as u64).wrapping_add((data[n - 1] as u64) << 2);
+            return smix(y.wrapping_mul(K2) ^ z.wrapping_mul(K0)).wrapping_mul(K2);
+        }
+        return K2;
+    }
+    if n <= 32 {
+        let mul = K2.wrapping_add((n as u64) * 2);
+        let a = f64(data, 0).wrapping_mul(K1);
+        let b = f64(data, 8);
+        let c = f64(data, n - 8).wrapping_mul(mul);
+        let d = f64(data, n - 16).wrapping_mul(K2);
+        return h16(rot(a.wrapping_add(b), 43).wrapping_add(rot(c, 30)).wrapping_add(d),
+                   a.wrapping_add(rot(b.wrapping_add(K2), 18)).wrapping_add(c), mul);
+    }
+    if n <= 64 {
+        let mul = K2.wrapping_add((n as u64) * 2);
+        let a = f64(data, 0).wrapping_mul(K2);
+        let b = f64(data, 8);
+        let c = f64(data, n - 24);
+        let d = f64(data, n - 32);
+        let e = f64(data, 16).wrapping_mul(K2);
+        let f = f64(data, 24).wrapping_mul(9);
+        let g = f64(data, n - 8);
+        let hh = f64(data, n - 16).wrapping_mul(mul);
+        let u = rot(a.wrapping_add(g), 43).wrapping_add((rot(b, 30).wrapping_add(c)).wrapping_mul(9));
+        let v = ((a.wrapping_add(g)) ^ d).wrapping_add(f).wrapping_add(1);
+        let w = (u.wrapping_add(v)).wrapping_mul(mul).swap_bytes().wrapping_add(hh);
+        let x = rot(e.wrapping_add(f), 42).wrapping_add(c);
+        let y = ((v.wrapping_add(w)).wrapping_mul(mul).swap_bytes().wrapping_add(g)).wrapping_mul(mul);
+        let z = e.wrapping_add(f).wrapping_add(c);
+        let a2 = (x.wrapping_add(z)).wrapping_mul(mul).wrapping_add(y).swap_bytes().wrapping_add(b);
+        let b2 = smix((z.wrapping_add(a2)).wrapping_mul(mul).wrapping_add(d).wrapping_add(hh)).wrapping_mul(mul);
+        return b2.wrapping_add(x);
+    }
+    // >64 bytes: chunk-based (raro per nomi PAK)
+    let mut x = f64(data, n - 40);
+    let mut y = f64(data, n - 16).wrapping_add(f64(data, n - 56));
+    let mut z = h16(f64(data, n - 48).wrapping_add(n as u64), f64(data, n - 24),
+                    K2.wrapping_add((n as u64) * 2));
+    // WeakHashLen32WithSeeds inlined for v,w
+    fn weak32(s: &[u8], off: usize, mut a: u64, mut b: u64) -> (u64, u64) {
+        let w = f64(s, off); let xx = f64(s, off+8);
+        let yy = f64(s, off+16); let zz = f64(s, off+24);
+        a = a.wrapping_add(w); b = rot(b.wrapping_add(a).wrapping_add(zz), 21);
+        let c = a; a = a.wrapping_add(xx).wrapping_add(yy);
+        b = b.wrapping_add(rot(a, 44)); (a.wrapping_add(zz), b.wrapping_add(c))
+    }
+    let mut v = weak32(data, n - 64, n as u64, z);
+    let mut w = weak32(data, n - 32, y.wrapping_add(K1), x);
+    x = x.wrapping_mul(K1).wrapping_add(f64(data, 0));
+    let mut pos = 0;
+    let chunks = (n - 1) / 64;
+    for _ in 0..chunks {
+        x = rot(x.wrapping_add(y).wrapping_add(v.0).wrapping_add(f64(data, pos + 8)), 37).wrapping_mul(K1);
+        y = rot(y.wrapping_add(v.1).wrapping_add(f64(data, pos + 48)), 42).wrapping_mul(K1);
+        x ^= w.1; y = y.wrapping_add(v.0).wrapping_add(f64(data, pos + 40));
+        z = rot(z.wrapping_add(w.0), 33).wrapping_mul(K1);
+        v = weak32(data, pos, v.1.wrapping_mul(K1), x.wrapping_add(w.0));
+        w = weak32(data, pos + 32, z.wrapping_add(w.1), y.wrapping_add(f64(data, pos + 16)));
+        std::mem::swap(&mut z, &mut x);
+        pos += 64;
+    }
+    h16(h16(v.0, w.0, K2.wrapping_add((n as u64)*2)).wrapping_add(smix(y).wrapping_mul(K1)).wrapping_add(z),
+        h16(v.1, w.1, K2.wrapping_add((n as u64)*2)).wrapping_add(x),
+        K2.wrapping_add((n as u64)*2))
+}
+
+/// Calcola il ContainerId UE5 dal nome base del PAK (come UTF-16LE + CityHash64).
+fn compute_container_id(base_name: &str) -> u64 {
+    let utf16le: Vec<u8> = base_name.encode_utf16()
+        .flat_map(|c| c.to_le_bytes())
+        .collect();
+    city_hash_64(&utf16le)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// IOSTORE CONTAINER WRITER
+// ═══════════════════════════════════════════════════════════════════
+
+/// Crea un file .pak vuoto (0 entry) come companion per IoStore container.
+/// UE5 scopre i container IoStore (.utoc/.ucas) solo se esiste un .pak con lo stesso basename.
+/// Usa Version=8 nel footer per evitare il formato indice complesso v10+ (PathHashIndex ecc.)
+/// che causa "Corrupt pak index" in alcuni build UE5.
+/// Il footer ha comunque 221 bytes (stessa dimensione di v11) perché l'engine lo legge
+/// sempre con il layout della versione più recente.
+fn create_empty_pak_companion() -> Vec<u8> {
+    use sha1::Digest;
+    
+    let mut pak = Vec::new();
+    
+    // === INDEX (v8 format: semplice MountPoint + NumEntries) ===
+    // Mount point FString: i32 length (include null) + data
+    let mount_point = b"../../../\0";
+    pak.extend_from_slice(&(mount_point.len() as i32).to_le_bytes());
+    pak.extend_from_slice(mount_point);
+    // NumEntries: 0
+    pak.extend_from_slice(&0i32.to_le_bytes());
+    
+    let index_size = pak.len() as u64; // 18 bytes
+    
+    // SHA1 of index data
+    let index_hash: [u8; 20] = sha1::Sha1::digest(&pak).into();
+    
+    // === FOOTER (221 bytes, Version=8) ===
+    // L'engine cerca il footer dalla fine del file con dimensione fissa 221.
+    // EncryptionKeyGuid (16 zero bytes = no encryption)
+    pak.extend_from_slice(&[0u8; 16]);
+    // bEncryptedIndex: false
+    pak.push(0u8);
+    // Magic: 0x5A6F12E1
+    pak.extend_from_slice(&0x5A6F12E1u32.to_le_bytes());
+    // Version: 8 (evita il parser v10+ che richiede PathHashIndex/FullDirectoryIndex)
+    pak.extend_from_slice(&8u32.to_le_bytes());
+    // IndexOffset: 0
+    pak.extend_from_slice(&0u64.to_le_bytes());
+    // IndexSize
+    pak.extend_from_slice(&index_size.to_le_bytes());
+    // IndexHash (SHA1)
+    pak.extend_from_slice(&index_hash);
+    // CompressionMethods (v8+): 5 methods × 32 bytes, all zeros (= None)
+    pak.extend_from_slice(&[0u8; 160]);
+    
+    log::info!("📦 PAK v8 companion creato: {} bytes (index={}, footer=221)", pak.len(), index_size);
+    pak
+}
+
+/// Crea un container IoStore (.utoc + .ucas) con i file patchati.
+/// I dati sono NON compressi per semplicità e compatibilità.
+/// Restituisce (utoc_bytes, ucas_bytes).
+fn create_iostore_container(
+    entries: &[(&[u8; 12], &[u8])], // (chunk_id, file_data)
+    utoc_version: u8,
+    block_size: u32,
+    original_header_size: u32,
+    container_id: u64,
+) -> (Vec<u8>, Vec<u8>) {
+    let bs = block_size as u64;
+    
+    // === UCAS: concatena i dati dei file in blocchi ===
+    let mut ucas = Vec::new();
+    
+    struct FileLayout {
+        virtual_offset: u64,
+        length: u64,
+    }
+    
+    let mut file_layouts: Vec<FileLayout> = Vec::new();
+    let mut block_entries: Vec<(u64, u32, u32)> = Vec::new(); // (ucas_offset, size, size)
+    let mut current_block_index: u64 = 0;
+    
+    for (_, data) in entries {
+        let file_virtual_offset = current_block_index * bs;
+        let file_length = data.len() as u64;
+        
+        file_layouts.push(FileLayout {
+            virtual_offset: file_virtual_offset,
+            length: file_length,
+        });
+        
+        if data.is_empty() {
+            continue;
+        }
+        
+        let mut remaining = data.len();
+        let mut data_offset = 0;
+        
+        while remaining > 0 {
+            let block_data_size = std::cmp::min(remaining, block_size as usize);
+            let ucas_offset = ucas.len() as u64;
+            
+            ucas.extend_from_slice(&data[data_offset..data_offset + block_data_size]);
+            
+            block_entries.push((ucas_offset, block_data_size as u32, block_data_size as u32));
+            
+            data_offset += block_data_size;
+            remaining -= block_data_size;
+            current_block_index += 1;
+        }
+    }
+    
+    let _ucas_size = ucas.len() as u64;
+    
+    // === UTOC ===
+    let entry_count = entries.len() as u32;
+    let compressed_block_count = block_entries.len() as u32;
+    
+    // Usa header_size originale per compatibilità con versioni UTOC recenti (v6-v8)
+    // I campi sconosciuti vengono paddati con zeri
+    let header_size = if original_header_size >= 81 {
+        original_header_size
+    } else {
+        let base: u32 = 16 + 1 + 3 + 4 * 9 + 8 + 16 + 1; // = 81
+        match utoc_version {
+            0..=3 => base,
+            4 => base + 3 + 4 + 8,
+            _ => base + 3 + 4 + 8 + 4,
+        }
+    };
+    
+    let mut utoc = Vec::with_capacity(header_size as usize + entries.len() * 22 + block_entries.len() * 12);
+    
+    // --- Header ---
+    utoc.extend_from_slice(UTOC_MAGIC);
+    utoc.push(utoc_version);
+    utoc.extend_from_slice(&[0u8; 3]); // Reserved
+    utoc.extend_from_slice(&header_size.to_le_bytes());
+    utoc.extend_from_slice(&entry_count.to_le_bytes());
+    utoc.extend_from_slice(&compressed_block_count.to_le_bytes());
+    utoc.extend_from_slice(&12u32.to_le_bytes()); // CompressedBlockEntrySize
+    utoc.extend_from_slice(&0u32.to_le_bytes()); // CompressionMethodNameCount = 0 (no compression)
+    utoc.extend_from_slice(&32u32.to_le_bytes()); // CompressionMethodNameLength
+    utoc.extend_from_slice(&block_size.to_le_bytes());
+    utoc.extend_from_slice(&0u32.to_le_bytes()); // DirectoryIndexSize = 0
+    utoc.extend_from_slice(&1u32.to_le_bytes()); // PartitionCount = 1
+    utoc.extend_from_slice(&container_id.to_le_bytes()); // ContainerId = CityHash64 del basename
+    utoc.extend_from_slice(&[0u8; 16]); // EncryptionKeyGuid = zeros
+    utoc.push(0u8); // ContainerFlags = 0
+    
+    // v4+ extra fields
+    if utoc_version >= 4 {
+        utoc.extend_from_slice(&[0u8; 3]); // Alignment padding
+        utoc.extend_from_slice(&0u32.to_le_bytes()); // PerfectHashSeedsCount = 0
+        utoc.extend_from_slice(&(-1i64 as u64).to_le_bytes()); // PartitionSize[0] = -1 (unlimited, come originale)
+    }
+    if utoc_version >= 5 {
+        utoc.extend_from_slice(&entry_count.to_le_bytes()); // ChunksWithoutPHCount = entry_count (no PH, use linear search)
+    }
+    
+    // Verify header size
+    if utoc.len() != header_size as usize {
+        log::warn!("⚠️ UTOC header size mismatch: got {}, expected {}", utoc.len(), header_size);
+        // Pad or truncate to match
+        while utoc.len() < header_size as usize {
+            utoc.push(0u8);
+        }
+        utoc.truncate(header_size as usize);
+    }
+    
+    // --- ChunkIDs (12 bytes each) ---
+    for (chunk_id, _) in entries {
+        utoc.extend_from_slice(*chunk_id);
+    }
+    
+    // --- OffsetAndLength (10 bytes each, 5+5 big-endian) ---
+    for fl in &file_layouts {
+        // 5 bytes offset (big-endian)
+        utoc.push((fl.virtual_offset >> 32) as u8);
+        utoc.push((fl.virtual_offset >> 24) as u8);
+        utoc.push((fl.virtual_offset >> 16) as u8);
+        utoc.push((fl.virtual_offset >> 8) as u8);
+        utoc.push(fl.virtual_offset as u8);
+        // 5 bytes length (big-endian)
+        utoc.push((fl.length >> 32) as u8);
+        utoc.push((fl.length >> 24) as u8);
+        utoc.push((fl.length >> 16) as u8);
+        utoc.push((fl.length >> 8) as u8);
+        utoc.push(fl.length as u8);
+    }
+    
+    // --- PerfectHashSeeds (0 entries) ---
+    
+    // --- ChunksWithoutPH (entry_count indices for linear search fallback) ---
+    if utoc_version >= 5 {
+        for i in 0..entry_count {
+            utoc.extend_from_slice(&i.to_le_bytes());
+        }
+    }
+    
+    // --- CompressedBlockEntries (12 bytes each, little-endian) ---
+    for (ucas_off, comp_sz, uncomp_sz) in &block_entries {
+        // 5 bytes offset (little-endian)
+        utoc.push(*ucas_off as u8);
+        utoc.push((*ucas_off >> 8) as u8);
+        utoc.push((*ucas_off >> 16) as u8);
+        utoc.push((*ucas_off >> 24) as u8);
+        utoc.push((*ucas_off >> 32) as u8);
+        // 3 bytes compressed size (little-endian)
+        utoc.push(*comp_sz as u8);
+        utoc.push((*comp_sz >> 8) as u8);
+        utoc.push((*comp_sz >> 16) as u8);
+        // 3 bytes uncompressed size (little-endian)
+        utoc.push(*uncomp_sz as u8);
+        utoc.push((*uncomp_sz >> 8) as u8);
+        utoc.push((*uncomp_sz >> 16) as u8);
+        // 1 byte method_index = 0 (uncompressed)
+        utoc.push(0u8);
+    }
+    
+    // --- CompressionMethodNames (0 entries) ---
+    // --- DirectoryIndex (0 bytes, no Indexed flag) ---
+    
+    // --- ChunkMetas (33 bytes each: 32-byte hash + 1-byte flags) ---
+    // UE5 SEMPRE legge entry_count × sizeof(FIoStoreTocEntryMeta) dopo DirectoryIndex.
+    // Senza questa sezione l'engine legge fuori range → crash AsyncLoading2.
+    //
+    // ChunkHash lasciato a zeri DELIBERATAMENTE: UE5 (FIoChunkHash) calcola questo
+    // campo con BLAKE3, non con SHA-1/SHA-2 (le uniche hash disponibili qui). Il
+    // container che generiamo è NON compresso, NON cifrato e senza signing
+    // (ContainerFlags=0), quindi l'engine non verifica l'integrità del chunk e
+    // gli zeri vengono accettati. Scrivere un hash con l'algoritmo sbagliato
+    // sarebbe PEGGIO degli zeri: se una build validasse, romperebbe il mount.
+    // Vero hash BLAKE3 → vedi ADR-002 (fase compressione/signing).
+    for _ in 0..entry_count {
+        utoc.extend_from_slice(&[0u8; 32]); // ChunkHash = zeros (vedi nota sopra)
+        utoc.push(0u8); // Flags = None (dati non compressi)
+    }
+    
+    log::info!("📦 IoStore writer: UTOC {} bytes (hdr={}, metas={}×33), UCAS {} bytes, {} file, {} blocchi", 
+        utoc.len(), header_size, entry_count, ucas.len(), entries.len(), block_entries.len());
+    
+    (utoc, ucas)
+}
+
+/// Applica traduzioni a DataTable .uasset (binary patching) e crea un container IoStore override (.utoc/.ucas)
+#[tauri::command]
+pub async fn apply_datatable_translation(
+    game_path: String,
+    translations: Vec<super::unreal_localization::TranslatedEntry>,
+    target_language: String,
+) -> Result<super::unreal_localization::TranslationPakResult, String> {
+    let game_dir = Path::new(&game_path);
+    let cache_dir = game_dir.join("GameStringer").join("uasset_cache");
+    
+    if !cache_dir.exists() {
+        return Err("Cache .uasset non trovata. Rieseguire l'estrazione.".into());
+    }
+    
+    log::info!("📝 DataTable IoStore patching: {} traduzioni per lingua {}", translations.len(), target_language);
+    
+    // Leggi chunk_map.json con ChunkID e metadata UTOC
+    let map_path = cache_dir.join("chunk_map.json");
+    let chunk_map_json: serde_json::Value = {
+        let data = fs::read_to_string(&map_path)
+            .map_err(|e| format!("chunk_map.json non trovato: {}. Rieseguire l'estrazione.", e))?;
+        serde_json::from_str(&data)
+            .map_err(|e| format!("chunk_map.json invalido: {}", e))?
+    };
+    
+    // Estrai metadata
+    let meta = chunk_map_json.get("__meta").and_then(|m| m.as_object());
+    let utoc_version = meta.and_then(|m| m.get("utoc_version"))
+        .and_then(|v| v.as_u64()).unwrap_or(3) as u8;
+    let block_size = meta.and_then(|m| m.get("block_size"))
+        .and_then(|v| v.as_u64()).unwrap_or(65536) as u32;
+    let original_header_size = meta.and_then(|m| m.get("header_size"))
+        .and_then(|v| v.as_u64()).unwrap_or(144) as u32;
+    
+    log::info!("📦 UTOC metadata: version={}, block_size={}, header_size={}", utoc_version, block_size, original_header_size);
+    
+    // Quante traduzioni sono effettivamente diverse dall'originale?
+    let actually_translated = translations.iter()
+        .filter(|t| t.original != t.translated)
+        .count();
+    log::info!("📊 Diagnostica: {}/{} traduzioni effettivamente diverse dall'originale",
+        actually_translated, translations.len());
+
+    // Se NIENTE è realmente tradotto non si spedisce nulla: prima qui veniva
+    // iniettato un marker fasullo "[IT] "+originale "per test override", che
+    // finiva nel container consegnato all'utente — testo finto spacciato per
+    // traduzione. Meglio fallire onestamente e non creare il container.
+    if actually_translated == 0 {
+        return Err(
+            "Nessuna traduzione da applicare: tutte le voci sono identiche all'originale. \
+             Traduci prima le stringhe, poi riprova."
+                .into(),
+        );
+    }
+
+    // Costruisci lookup: original → translated, saltando le voci non tradotte
+    // (una traduzione identica non deve sovrascrivere nulla nel .uasset).
+    let mut translation_lookup: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for t in &translations {
+        if t.original == t.translated {
+            continue;
+        }
+        translation_lookup.insert(t.original.trim().to_string(), t.translated.clone());
+    }
+    
+    log::info!("📦 {} traduzioni nel lookup, {} file nel chunk_map", 
+        translation_lookup.len(), 
+        chunk_map_json.as_object().map(|m| m.len().saturating_sub(1)).unwrap_or(0));
+    
+    // Per ogni file cached nel chunk_map, cerca stringhe originali nel .uasset e applica traduzioni
+    let mut iostore_entries: Vec<([u8; 12], Vec<u8>)> = Vec::new();
+    let mut total_patched = 0usize;
+    let mut skipped_no_chunk = 0usize;
+    
+    let chunk_map_obj = chunk_map_json.as_object()
+        .ok_or("chunk_map.json non è un oggetto JSON")?;
+    
+    for (file_key, chunk_id_val) in chunk_map_obj {
+        // Skip metadata
+        if file_key == "__meta" { continue; }
+        
+        let chunk_id_hex = match chunk_id_val.as_str() {
+            Some(hex) => hex,
+            None => continue,
+        };
+        
+        let cache_path = cache_dir.join(file_key);
+        if !cache_path.exists() {
+            log::warn!("⚠️ Cache non trovata per {}", file_key);
+            continue;
+        }
+        
+        // Leggi il .uasset cached
+        let uasset_data = match fs::read(&cache_path) {
+            Ok(d) => d,
+            Err(e) => {
+                log::warn!("⚠️ Errore lettura cache {}: {}", file_key, e);
+                continue;
+            }
+        };
+        
+        // Scansiona le FString nel .uasset e cerca match nella translation_lookup
+        // Questo è O(n+m) — scansioniamo il binary una volta e facciamo lookup diretto nel HashMap
+        let mut replacements: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let data_offset = find_uasset_data_offset(&uasset_data);
+        
+        {
+            let mut scan_i = data_offset;
+            while scan_i + 4 < uasset_data.len() {
+                let len = i32::from_le_bytes([
+                    uasset_data[scan_i], uasset_data[scan_i+1], 
+                    uasset_data[scan_i+2], uasset_data[scan_i+3]
+                ]);
+                if (3..=2000).contains(&len) {
+                    let str_start = scan_i + 4;
+                    let str_end = str_start + (len as usize);
+                    if str_end <= uasset_data.len() && uasset_data[str_end - 1] == 0 {
+                        if let Ok(text) = std::str::from_utf8(&uasset_data[str_start..str_end - 1]) {
+                            let trimmed = text.trim();
+                            if let Some(translated) = translation_lookup.get(trimmed) {
+                                replacements.insert(trimmed.to_string(), translated.clone());
+                            }
+                        }
+                        scan_i = str_end;
+                        continue;
+                    }
+                }
+                scan_i += 1;
+            }
+        }
+        
+        if replacements.is_empty() {
+            continue;
+        }
+        
+        // Decodifica ChunkID hex → bytes
+        let chunk_id_bytes: Vec<u8> = (0..chunk_id_hex.len())
+            .step_by(2)
+            .filter_map(|i| u8::from_str_radix(&chunk_id_hex[i..i+2], 16).ok())
+            .collect();
+        
+        if chunk_id_bytes.len() != 12 {
+            log::warn!("⚠️ ChunkID invalido per {} (len={}): {}", file_key, chunk_id_bytes.len(), chunk_id_hex);
+            skipped_no_chunk += 1;
+            continue;
+        }
+        
+        let mut chunk_id = [0u8; 12];
+        chunk_id.copy_from_slice(&chunk_id_bytes);
+        
+        log::info!("🔧 Patching {} ({} stringhe, {} bytes, chunk={})", 
+            file_key, replacements.len(), uasset_data.len(), chunk_id_hex);
+        
+        let patched = patch_uasset_binary(&uasset_data, &replacements);
+        
+        total_patched += replacements.len();
+        iostore_entries.push((chunk_id, patched));
+    }
+    
+    if iostore_entries.is_empty() {
+        return Err(format!(
+            "Nessun file patchato (skipped {} senza ChunkID)", skipped_no_chunk
+        ));
+    }
+    
+    log::info!("📦 Creazione IoStore container: {} file patchati, {} skippati", 
+        iostore_entries.len(), skipped_no_chunk);
+    
+    // Crea il container IoStore
+    let entries_ref: Vec<(&[u8; 12], &[u8])> = iostore_entries.iter()
+        .map(|(id, data)| (id, data.as_slice()))
+        .collect();
+    
+    // Calcola base_name e ContainerId PRIMA di creare il container
+    let paks_dir = super::unreal_localization::find_paks_dir(game_dir)
+        .ok_or("Directory Content/Paks non trovata")?;
+    let project_name = super::unreal_localization::find_project_name(game_dir)
+        .unwrap_or_else(|| "Game".to_string());
+    let base_name = format!("{}_GameStringer_{}_P", project_name, target_language);
+    
+    let container_id = compute_container_id(&base_name);
+    log::info!("📦 ContainerId per '{}': 0x{:016X}", base_name, container_id);
+    
+    let (utoc_data, ucas_data) = create_iostore_container(&entries_ref, utoc_version, block_size, original_header_size, container_id);
+    
+    let utoc_path = paks_dir.join(format!("{}.utoc", base_name));
+    let ucas_path = paks_dir.join(format!("{}.ucas", base_name));
+    
+    // Crea companion .pak vuoto (UE5 scopre IoStore solo se esiste .pak con stesso basename)
+    let pak_path = paks_dir.join(format!("{}.pak", base_name));
+    let pak_data = create_empty_pak_companion();
+    fs::write(&pak_path, &pak_data)
+        .map_err(|e| format!("Errore scrittura PAK companion: {}", e))?;
+    log::info!("� PAK companion creato: {} ({} bytes)", pak_path.display(), pak_data.len());
+    
+    fs::write(&utoc_path, &utoc_data)
+        .map_err(|e| format!("Errore scrittura UTOC: {}", e))?;
+    fs::write(&ucas_path, &ucas_data)
+        .map_err(|e| format!("Errore scrittura UCAS: {}", e))?;
+    
+    log::info!("✅ IoStore override salvato: {}.utoc ({} bytes) + .ucas ({} bytes), {} file, {} stringhe", 
+        base_name, utoc_data.len(), ucas_data.len(), iostore_entries.len(), total_patched);
+    
+    Ok(super::unreal_localization::TranslationPakResult {
+        success: true,
+        pak_path: utoc_path.to_string_lossy().to_string(),
+        entries_count: total_patched,
+        message: format!(
+            "Creato IoStore {}.utoc/.ucas con {} traduzioni da {} DataTable ({})",
+            base_name, total_patched, iostore_entries.len(), target_language
+        ),
+    })
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// PAK READER (formato UE .pak v8–v11) — per i .locres che stanno nel .pak
+// classico invece che nell'IoStore. il gioco di collaudo teneva lì il Game.locres, compresso
+// Oodle. Strategia difensiva: per l'estrazione ci si affida SOLO all'header
+// INLINE della entry (campi espliciti, niente bitfield), decodificando dagli
+// EncodedPakEntries il solo Offset (campo non ambiguo). I blocchi si leggono
+// contigui usando la loro DIMENSIONE (end-start), non la posizione assoluta:
+// robusto sui pak non cifrati. Un formato inatteso → errore rumoroso, mai
+// garbage (stessa disciplina di [locres-magic-sbagliato]).
+// ═══════════════════════════════════════════════════════════════════
+
+const PAK_MAGIC_LE: u32 = 0x5A6F12E1;
+
+fn pak_read_fstring(data: &[u8], pos: &mut usize) -> Result<String, String> {
+    if *pos + 4 > data.len() { return Err("FString: EOF su len".into()); }
+    let len = i32::from_le_bytes([data[*pos], data[*pos+1], data[*pos+2], data[*pos+3]]);
+    *pos += 4;
+    if len == 0 { return Ok(String::new()); }
+    if len < 0 {
+        let units = (-len) as usize;
+        let nb = units * 2;
+        if *pos + nb > data.len() { return Err("FString: EOF su UTF16".into()); }
+        let mut s = String::with_capacity(units);
+        for i in 0..units {
+            let u = u16::from_le_bytes([data[*pos + i*2], data[*pos + i*2 + 1]]);
+            if u == 0 { break; }
+            s.push(char::from_u32(u as u32).unwrap_or('?'));
+        }
+        *pos += nb;
+        Ok(s)
+    } else {
+        let nb = len as usize;
+        if *pos + nb > data.len() { return Err("FString: EOF su ASCII".into()); }
+        let end = if nb > 0 && data[*pos + nb - 1] == 0 { nb - 1 } else { nb };
+        let s = String::from_utf8_lossy(&data[*pos..*pos + end]).into_owned();
+        *pos += nb;
+        Ok(s)
+    }
+}
+
+fn rd_u32(d: &[u8], p: &mut usize) -> Result<u32, String> {
+    if *p + 4 > d.len() { return Err("EOF u32".into()); }
+    let v = u32::from_le_bytes([d[*p], d[*p+1], d[*p+2], d[*p+3]]); *p += 4; Ok(v)
+}
+fn rd_i32(d: &[u8], p: &mut usize) -> Result<i32, String> {
+    Ok(rd_u32(d, p)? as i32)
+}
+fn rd_u64(d: &[u8], p: &mut usize) -> Result<u64, String> {
+    if *p + 8 > d.len() { return Err("EOF u64".into()); }
+    let mut b = [0u8; 8]; b.copy_from_slice(&d[*p..*p+8]); *p += 8; Ok(u64::from_le_bytes(b))
+}
+
+struct PakFooter {
+    version: u32,
+    index_offset: u64,
+    index_size: u64,
+    compression_methods: Vec<String>, // index 0 = "None" implicito
+    encrypted_index: bool,
+}
+
+/// Legge il footer ancorandosi al MAGIC scansionato dalla fine: evita di dover
+/// indovinare la dimensione esatta del footer (varia per versione).
+fn pak_read_footer(data: &[u8]) -> Result<PakFooter, String> {
+    let magic_bytes = PAK_MAGIC_LE.to_le_bytes();
+    let start = data.len().saturating_sub(1024);
+    let mut magic_pos = None;
+    let mut i = data.len().saturating_sub(4);
+    while i >= start {
+        if data[i..i+4] == magic_bytes { magic_pos = Some(i); break; }
+        if i == 0 { break; }
+        i -= 1;
+    }
+    let m = magic_pos.ok_or("Magic PAK (0x5A6F12E1) non trovato nel footer")?;
+
+    let version = u32::from_le_bytes([data[m+4], data[m+5], data[m+6], data[m+7]]);
+    let index_offset = u64::from_le_bytes(data[m+8..m+16].try_into().unwrap());
+    let index_size = u64::from_le_bytes(data[m+16..m+24].try_into().unwrap());
+    // dopo l'hash (20) i nomi dei metodi di compressione, 32 byte l'uno fino a EOF.
+    let mut methods = vec!["None".to_string()];
+    let mut off = m + 24 + 20;
+    while off + 32 <= data.len() {
+        let raw = &data[off..off+32];
+        let name = String::from_utf8_lossy(raw).trim_end_matches('\0').trim().to_string();
+        if !name.is_empty() { methods.push(name); }
+        off += 32;
+    }
+    // bEncryptedIndex sta subito prima del magic.
+    let encrypted_index = m >= 1 && data[m-1] != 0;
+
+    Ok(PakFooter { version, index_offset, index_size, compression_methods: methods, encrypted_index })
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// PAK CIFRATI — decifratura dell'indice con chiave fornita dall'utente
+// ═══════════════════════════════════════════════════════════════════
+//
+// Alcuni giochi UE cifrano l'indice del .pak (AES-256, ECB) per scoraggiare il
+// datamining. Fino al 19/08/2026 il lettore si fermava con «non supportato» e
+// quei giochi risultavano non traducibili, anche col testo tutto lì dentro.
+//
+// GameStringer NON ricostruisce la chiave: sarebbe aggirare una misura tecnica
+// di protezione, e la nostra ANTI_PIRACY.md dichiara che non lo facciamo. La
+// chiave la fornisce l'utente, esattamente come fanno `repak --aes-key` e
+// `retoc --aes-key`. Se non ce l'ha, il gioco resta fuori portata e il
+// messaggio lo dice chiaro invece di fingere un guasto.
+//
+// La chiave vive nello store cifrato (AES-256-GCM, derivata per macchina e
+// utente) insieme alle API key: stesso posto, stesse garanzie.
+
+type AesKey = [u8; 32];
+
+/// Nome sotto cui la chiave di un gioco vive nello store sicuro.
+fn pak_aes_key_name(game_path: &str) -> String {
+    let leaf = Path::new(game_path)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| game_path.to_string());
+    format!("PAK_AES::{}", leaf)
+}
+
+/// Accetta la chiave nelle due forme che usano i tool del settore: base64
+/// (44 caratteri) o esadecimale (64 caratteri), con o senza `0x`.
+pub fn parse_aes_key(raw: &str) -> Result<AesKey, String> {
+    use base64::Engine;
+    let t = raw.trim();
+    let mut out = [0u8; 32];
+
+    // Il prefisso "0x" si toglie SOLO se quel che resta e' davvero esadecimale.
+    // '0' e 'x' appartengono anche all'alfabeto base64, quindi toglierlo sempre
+    // mutilava una chiave base64 valida che iniziava per quei due caratteri:
+    // misurato, capita a circa 1 chiave su 2500, e l'utente si sentiva dire che
+    // la sua chiave corretta non era ne' esadecimale ne' base64.
+    let senza_prefisso = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X"));
+    let e_hex = |x: &str| x.len() == 64 && x.chars().all(|c| c.is_ascii_hexdigit());
+    let s = match senza_prefisso {
+        Some(resto) if e_hex(resto) => resto,
+        _ => t,
+    };
+
+    if e_hex(s) {
+        for i in 0..32 {
+            out[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)
+                .map_err(|_| "esadecimale non valido".to_string())?;
+        }
+        return Ok(out);
+    }
+
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(s)
+        .map_err(|_| "la chiave non è né esadecimale (64 caratteri) né base64".to_string())?;
+    if decoded.len() != 32 {
+        return Err(format!("una chiave AES-256 è di 32 byte, questa ne ha {}", decoded.len()));
+    }
+    out.copy_from_slice(&decoded);
+    Ok(out)
+}
+
+/// Decifra in place in ECB: UE cifra l'indice a blocchi indipendenti da 16 byte.
+fn aes256_ecb_decrypt(key: &AesKey, buf: &mut [u8]) {
+    use aes::cipher::{BlockDecrypt, KeyInit, generic_array::GenericArray};
+    let cipher = aes::Aes256::new(GenericArray::from_slice(key));
+    for chunk in buf.chunks_exact_mut(16) {
+        cipher.decrypt_block(GenericArray::from_mut_slice(chunk));
+    }
+}
+
+/// Vero se la chiave apre davvero l'indice.
+///
+/// L'indice comincia con la FString del mount point, che nei pak veri è un
+/// percorso relativo tipo `../../../Gioco/Content/`. Con la chiave sbagliata
+/// escono byte casuali e la lunghezza non sta in piedi: così l'utente riceve
+/// «chiave sbagliata» subito, invece di un parse fallito 200 righe più in là.
+fn key_opens_pak_index(data: &[u8], footer: &PakFooter, key: &AesKey) -> bool {
+    let off = footer.index_offset as usize;
+    if off + 32 > data.len() { return false; }
+    let mut head = data[off..off + 32].to_vec();
+    aes256_ecb_decrypt(key, &mut head);
+
+    let len = i32::from_le_bytes([head[0], head[1], head[2], head[3]]);
+    if len > 1 && (len as usize) <= 28 {
+        let n = len as usize - 1; // la lunghezza include il NUL finale
+        return head[4..4 + n].iter().all(|&b| (0x20..0x7f).contains(&b)) && head[4 + n] == 0;
+    }
+    // Negare i32::MIN va in overflow, e con una chiave sbagliata i byte sono
+    // casuali: prima o poi quel valore esce. Un sentinella (0) non basta —
+    // passerebbe il controllo di lunghezza e poi sottrarrebbe sotto zero — per
+    // cui qui si esce e basta. Sotto, `len <= -2` garantisce `neg >= 2`.
+    if len < -1 {
+        let Some(neg) = len.checked_neg() else { return false };
+        let n = neg as usize - 1;
+        if (neg as usize) * 2 > 26 { return false; }
+        return (0..n).all(|i| head[5 + i * 2] == 0 && (0x20..0x7f).contains(&head[4 + i * 2]));
+    }
+    false
+}
+
+/// Marcatore riconoscibile dal frontend: significa «serve la chiave», non
+/// «è rotto». La UI ci si aggancia per proporre il campo invece di un errore.
+pub const PAK_NEEDS_AES: &str = "PAK_ENCRYPTED_NEEDS_AES_KEY";
+
+/// Come sopra, ma una chiave c'e' gia' e non apre questo pak. Senza un marcatore
+/// distinto l'errore finiva nel ramo generico e l'utente leggeva «questo gioco
+/// non espone testi estraibili» con una chiave sbagliata in cassaforte: il
+/// messaggio piu' fuorviante possibile, perche' nasconde l'unica cosa che
+/// potrebbe sistemare da solo.
+pub const PAK_WRONG_AES: &str = "PAK_ENCRYPTED_WRONG_AES_KEY";
+
+/// L'indice decifrato, se il pak è cifrato e abbiamo la chiave giusta.
+fn decrypt_pak_index(data: &[u8], footer: &PakFooter, game_path: Option<&str>) -> Result<Vec<u8>, String> {
+    let stored = game_path
+        .and_then(|g| super::secure_storage::get_secure_key(pak_aes_key_name(g)).ok().flatten());
+    let raw = stored.ok_or_else(|| PAK_NEEDS_AES.to_string())?;
+    let key = parse_aes_key(&raw)?;
+
+    if !key_opens_pak_index(data, footer, &key) {
+        return Err(PAK_WRONG_AES.to_string());
+    }
+
+    let off = footer.index_offset as usize;
+    let span = ((footer.index_size as usize) + 15) & !15; // UE cifra a multipli di 16
+    if off + span > data.len() { return Err("indice cifrato oltre EOF".into()); }
+    let mut buf = data[off..off + span].to_vec();
+    aes256_ecb_decrypt(&key, &mut buf);
+    buf.truncate(footer.index_size as usize);
+    log::info!("🔓 Indice pak decifrato ({} byte)", buf.len());
+    Ok(buf)
+}
+
+/// Salva la chiave AES di un gioco. Valida il formato subito: una chiave
+/// incollata male deve fallire qui, con un messaggio leggibile, non più tardi
+/// dentro il parser dell'indice.
+#[tauri::command]
+pub fn set_pak_aes_key(game_path: String, key: String) -> Result<(), String> {
+    parse_aes_key(&key)?; // solo per validare
+    super::secure_storage::set_secure_key(pak_aes_key_name(&game_path), key.trim().to_string())
+}
+
+#[tauri::command]
+pub fn clear_pak_aes_key(game_path: String) -> Result<(), String> {
+    super::secure_storage::remove_secure_key(pak_aes_key_name(&game_path))
+}
+
+struct PakLocres { path: String, data: Vec<u8> }
+
+/// Estrae e decomprime tutti i `.locres` da un file .pak. Ritorna (path, bytes).
+///
+/// Resta per i test, che non hanno un gioco a cui riferirsi: la produzione usa
+/// `extract_locres_from_pak_for_game`, che sa dove cercare la chiave AES.
+#[cfg(test)]
+fn extract_locres_from_pak(pak_path: &Path, oodle: &Option<OodleLib>) -> Result<Vec<PakLocres>, String> {
+    extract_files_by_ext_from_pak(pak_path, oodle, ".locres")
+}
+
+/// Variante che sa a quale gioco appartiene il pak: serve solo per ritrovare la
+/// chiave AES salvata, se l'indice è cifrato. Gli altri chiamanti (e i test)
+/// restano sulla firma senza game_path.
+fn extract_locres_from_pak_for_game(
+    pak_path: &Path,
+    oodle: &Option<OodleLib>,
+    game_path: Option<&str>,
+) -> Result<Vec<PakLocres>, String> {
+    extract_files_by_ext_from_pak_for_game(pak_path, oodle, ".locres", game_path)
+}
+
+/// Come sopra ma con estensione parametrica (".locres", ".locmeta", …).
+/// Il filtro è un ends_with case-insensitive sul path dentro il pak.
+fn extract_files_by_ext_from_pak(pak_path: &Path, oodle: &Option<OodleLib>, ext: &str) -> Result<Vec<PakLocres>, String> {
+    extract_files_by_ext_from_pak_for_game(pak_path, oodle, ext, None)
+}
+
+fn extract_files_by_ext_from_pak_for_game(
+    pak_path: &Path,
+    oodle: &Option<OodleLib>,
+    ext: &str,
+    game_path: Option<&str>,
+) -> Result<Vec<PakLocres>, String> {
+    let data = fs::read(pak_path).map_err(|e| format!("lettura pak {}: {}", pak_path.display(), e))?;
+    let footer = pak_read_footer(&data)?;
+    log::info!("📦 PAK v{} · index@{} ({} byte) · metodi: {:?}",
+        footer.version, footer.index_offset, footer.index_size, footer.compression_methods);
+
+    // L'indice cifrato non è più un vicolo cieco: con la chiave dell'utente si
+    // apre, senza si esce con un marcatore che la UI sa tradurre in «incolla la
+    // chiave qui» invece che in un errore muto.
+    let decrypted;
+    let idx: &[u8] = if footer.encrypted_index {
+        decrypted = decrypt_pak_index(&data, &footer, game_path)?;
+        &decrypted
+    } else {
+        let io = footer.index_offset as usize;
+        let ie = io + footer.index_size as usize;
+        if ie > data.len() { return Err("index oltre EOF".into()); }
+        &data[io..ie]
+    };
+
+    // ── Indice LEGACY (pak v3–v9): mount + N × (FString path, FPakEntry) ───
+    // Serve per leggere i pak che scriviamo NOI: `create_pak_v4` dichiara footer
+    // versione 8 e scrive l'indice in questo formato, mentre i giochi UE5 recenti
+    // (esempio reale: v11) usano l'indice path-hash + Full Directory Index. Senza questo
+    // ramo il reader falliva con "FDI oltre EOF" proprio sul nostro override.
+    if footer.version < 10 {
+        let mut p = 0usize;
+        let _mount = pak_read_fstring(idx, &mut p)?;
+        let n = rd_i32(idx, &mut p)?;
+        if n < 0 || n > 500_000 { return Err(format!("num entry legacy assurdo: {}", n)); }
+        let mut out = Vec::new();
+        for _ in 0..n {
+            let path = pak_read_fstring(idx, &mut p)?;
+            // FPakEntry inline nell'indice: offset,size,uncompressed,method,hash[20]
+            let entry_offset = rd_u64(idx, &mut p)?;
+            let size = rd_u64(idx, &mut p)?;
+            let uncompressed = rd_u64(idx, &mut p)?;
+            let method_index = rd_u32(idx, &mut p)?;
+            if p + 20 > idx.len() { return Err("indice legacy: EOF su hash".into()); }
+            p += 20;
+            if method_index != 0 {
+                let nb = rd_i32(idx, &mut p)?;
+                if nb < 0 || nb > 100_000 { return Err("indice legacy: block count assurdo".into()); }
+                p += (nb as usize) * 16;
+            }
+            if p + 5 > idx.len() { return Err("indice legacy: EOF su flags".into()); }
+            p += 1;  // encrypted flag
+            p += 4;  // block size
+
+            if !path.to_lowercase().ends_with(ext) { continue; }
+            // I dati veri stanno a entry_offset, DOPO l'header inline ripetuto.
+            match pak_extract_at(&data, entry_offset as usize, size, uncompressed, method_index, &footer, oodle) {
+                Ok(bytes) => {
+                    log::info!("  📄 [legacy] {} → {} byte", path, bytes.len());
+                    out.push(PakLocres { path, data: bytes });
+                }
+                Err(e) => log::warn!("  ⚠️ [legacy] {} non estratto: {}", path, e),
+            }
+        }
+        log::info!("📦 PAK legacy v{}: {} .locres", footer.version, out.len());
+        return Ok(out);
+    }
+
+    // ── Index (formato path-hash, UE 4.26+/v10+) ──────────────────────────
+    let mut p = 0usize;
+    let _mount = pak_read_fstring(idx, &mut p)?;
+    let _num_entries = rd_u32(idx, &mut p)?;
+    let _path_hash_seed = rd_u64(idx, &mut p)?;
+    let has_path_hash = rd_u32(idx, &mut p)? != 0;
+    if has_path_hash {
+        let _pho = rd_u64(idx, &mut p)?; let _phs = rd_u64(idx, &mut p)?;
+        p += 20; // hash
+    }
+    let has_fdi = rd_u32(idx, &mut p)? != 0;
+    if !has_fdi {
+        return Err(format!("pak v{} senza Full Directory Index: path non disponibili", footer.version));
+    }
+    let fdi_off = rd_u64(idx, &mut p)? as usize;
+    let fdi_size = rd_u64(idx, &mut p)? as usize;
+    p += 20; // fdi hash
+    let enc_size = rd_u32(idx, &mut p)? as usize;
+    if p + enc_size > idx.len() { return Err("EncodedPakEntries oltre l'index".into()); }
+    let encoded = &idx[p..p + enc_size];
+
+    if fdi_off + fdi_size > data.len() {
+        return Err(format!(
+            "FDI oltre EOF (pak v{}, fdi@{}+{} su {} byte): formato indice inatteso per questa versione",
+            footer.version, fdi_off, fdi_size, data.len()
+        ));
+    }
+    let fdi = &data[fdi_off..fdi_off + fdi_size];
+
+    // ── Full Directory Index: dir → (file → offset dentro `encoded`) ──────
+    let mut fp = 0usize;
+    let num_dirs = rd_u32(fdi, &mut fp)?;
+    if num_dirs > 1_000_000 { return Err(format!("num_dirs assurdo: {}", num_dirs)); }
+    let mut locres_targets: Vec<(String, u32)> = Vec::new();
+    for _ in 0..num_dirs {
+        let dir = pak_read_fstring(fdi, &mut fp)?;
+        let num_files = rd_u32(fdi, &mut fp)?;
+        for _ in 0..num_files {
+            let file = pak_read_fstring(fdi, &mut fp)?;
+            let enc_off = rd_u32(fdi, &mut fp)?;
+            if file.to_lowercase().ends_with(ext) {
+                let full = format!("{}{}", dir, file);
+                locres_targets.push((full, enc_off));
+            }
+        }
+    }
+    log::info!("📦 PAK: {} file .locres nell'indice", locres_targets.len());
+
+    // ── Per ogni .locres: Offset dall'encoded entry, poi header inline ────
+    let mut out = Vec::new();
+    for (path, enc_off) in &locres_targets {
+        match pak_extract_one(&data, encoded, *enc_off as usize, &footer, oodle) {
+            Ok(bytes) => {
+                log::info!("  📄 {} → {} byte decompressi", path, bytes.len());
+                out.push(PakLocres { path: path.clone(), data: bytes });
+            }
+            Err(e) => log::warn!("  ⚠️ {} non estratto: {}", path, e),
+        }
+    }
+    Ok(out)
+}
+
+/// Cerca il `Game.locmeta` ORIGINALE del gioco dentro i suoi .pak.
+///
+/// Serve ad `apply_unreal_translation` per registrare la cultura target
+/// PARTENDO dai metadati veri del gioco: un locmeta inventato da zero che
+/// elencasse meno culture di quelle reali cancellerebbe lingue dal menu.
+/// Ritorna (path dentro il pak, bytes) del candidato migliore, oppure None —
+/// e None è una risposta legittima: chi chiama NON deve inventarsi il file.
+pub fn read_game_locmeta(game_dir: &Path) -> Option<(String, Vec<u8>)> {
+    let oodle = OodleLib::load().ok();
+    if oodle.is_none() {
+        log::warn!("⚠️ locmeta: Oodle non caricato — se il .locmeta è compresso non si estrarrà");
+    }
+    let is_engine = |p: &str| {
+        let l = p.to_lowercase();
+        l.contains("engine/") || l.contains("engine\\") || l.contains("/plugins/") || l.contains("\\plugins\\")
+    };
+
+    let mut best: Option<(String, Vec<u8>)> = None;
+    for pak in find_pak_files(game_dir) {
+        // I nostri override si chiamano *_GameStringer_*_P.pak: leggerli qui
+        // significherebbe partire dal NOSTRO locmeta della volta scorsa invece
+        // che da quello del gioco — un'eco, non una fonte.
+        if pak.file_name().and_then(|n| n.to_str()).map(|n| n.contains("GameStringer")).unwrap_or(false) {
+            continue;
+        }
+        let list = match extract_files_by_ext_from_pak(&pak, &oodle, ".locmeta") {
+            Ok(l) => l,
+            Err(e) => { log::warn!("⚠️ locmeta: pak {}: {}", pak.display(), e); continue; }
+        };
+        for f in list {
+            if is_engine(&f.path) { continue; }
+            let lp = f.path.to_lowercase();
+            let is_game_target = lp.ends_with("/game.locmeta") || lp.ends_with("\\game.locmeta");
+            // Primo candidato qualsiasi; poi un Game.locmeta scalza un non-Game.
+            let replace = match &best {
+                None => true,
+                Some((bp, _)) => is_game_target && !bp.to_lowercase().contains("game.locmeta"),
+            };
+            if replace {
+                best = Some((f.path, f.data));
+            }
+        }
+    }
+    if let Some((p, d)) = &best {
+        log::info!("📗 locmeta originale trovato: {} ({} byte)", p, d.len());
+    }
+    best
+}
+
+/// Conta le entry CON TESTO nei .locres di un _P.pak nostro, deduplicate per
+/// (namespace, key): il pak può contenere lo stesso .locres sotto più culture
+/// (override en) e senza dedup il numero raddoppia (il famoso "1622").
+///
+/// Nato il 02/08/2026 sera: il pannello di stato diceva "0 stringhe tradotte"
+/// su una patch che metteva l'italiano A SCHERMO. Il vecchio contatore leggeva
+/// il footer, BUTTAVA VIA la versione e parsava l'indice con versione 4
+/// cablata: su un pak repak-V11 il parse falliva, l'if-let inghiottiva
+/// l'errore e il contatore restava 0 — un fallimento muto dentro il pannello
+/// che dovrebbe dire la verità sulla patch.
+pub fn count_pak_translated_entries(pak_path: &Path) -> usize {
+    let oodle = OodleLib::load().ok();
+    let list = match extract_files_by_ext_from_pak(pak_path, &oodle, ".locres") {
+        Ok(l) => l,
+        Err(e) => {
+            log::warn!("⚠️ conteggio patch: pak {} illeggibile: {}", pak_path.display(), e);
+            return 0;
+        }
+    };
+    let mut seen = std::collections::HashSet::new();
+    for f in list {
+        match super::unreal_localization::parse_locres_pub(&f.data) {
+            Ok((_v, entries)) => {
+                for e in entries {
+                    if !e.value.is_empty() {
+                        seen.insert((e.namespace, e.key));
+                    }
+                }
+            }
+            Err(e) => log::warn!("⚠️ conteggio patch: {} non parsabile: {}", f.path, e),
+        }
+    }
+    seen.len()
+}
+
+/// Decodifica il solo Offset dall'encoded entry (campo non ambiguo), poi legge
+/// l'header inline (campi espliciti) e ricompone i dati decomprimendo i blocchi.
+fn pak_extract_one(
+    data: &[u8], encoded: &[u8], enc_off: usize, footer: &PakFooter, oodle: &Option<OodleLib>,
+) -> Result<Vec<u8>, String> {
+    let mut ep = enc_off;
+    let value = rd_u32(encoded, &mut ep)?;
+    let b_offset_32 = value & (1 << 31) != 0;
+    let entry_offset = if b_offset_32 {
+        rd_u32(encoded, &mut ep)? as u64
+    } else {
+        rd_u64(encoded, &mut ep)?
+    };
+
+    // Header INLINE all'offset della entry (FPakEntry::Serialize).
+    let mut hp0 = entry_offset as usize;
+    let _off = rd_u64(data, &mut hp0)?;
+    let size = rd_u64(data, &mut hp0)?;             // dimensione compressa
+    let uncompressed = rd_u64(data, &mut hp0)?;
+    let method_index = rd_u32(data, &mut hp0)?;     // 0 = nessuna
+    pak_extract_at(data, entry_offset as usize, size, uncompressed, method_index, footer, oodle)
+}
+
+/// Legge i dati di UNA entry a partire dal suo offset: salta l'header inline,
+/// poi decomprime i blocchi (o copia i byte se non compressa).
+/// Condiviso fra indice legacy (v3–v9) e path-hash (v10+): il layout dei dati
+/// è lo stesso, cambia solo da dove si è ricavato l'offset.
+fn pak_extract_at(
+    data: &[u8], entry_offset: usize, size: u64, uncompressed: u64, method_index: u32,
+    footer: &PakFooter, oodle: &Option<OodleLib>,
+) -> Result<Vec<u8>, String> {
+    let mut hp = entry_offset;
+    let _off = rd_u64(data, &mut hp)?;
+    let _size = rd_u64(data, &mut hp)?;
+    let _unc = rd_u64(data, &mut hp)?;
+    let _mi = rd_u32(data, &mut hp)?;
+    hp += 20;                                       // hash SHA1
+    let mut blocks: Vec<(u64, u64)> = Vec::new();
+    if method_index != 0 {
+        let n = rd_i32(data, &mut hp)?;
+        if n < 0 || n > 100_000 { return Err(format!("block count assurdo: {}", n)); }
+        for _ in 0..n {
+            let s = rd_u64(data, &mut hp)?;
+            let e = rd_u64(data, &mut hp)?;
+            blocks.push((s, e));
+        }
+    }
+    let _flags = if hp < data.len() { let f = data[hp]; hp += 1; f } else { 0 };
+    let block_size = rd_u32(data, &mut hp).unwrap_or(0) as u64; // dim. blocco DECOMPRESSO
+    let data_start = hp; // i dati iniziano subito dopo l'header inline
+
+    let method = footer.compression_methods.get(method_index as usize)
+        .cloned().unwrap_or_else(|| "None".to_string());
+    let m = method.to_lowercase();
+
+    // Nessuna compressione: leggi `size` byte grezzi.
+    if method_index == 0 || m == "none" {
+        let end = data_start + size as usize;
+        if end > data.len() { return Err("dati non compressi oltre EOF".into()); }
+        return Ok(data[data_start..end].to_vec());
+    }
+
+    // Compressi a blocchi. Gli offset start/end dei blocchi sono RELATIVI
+    // all'Offset della entry (pak v8+ RelativeChunkOffsets, come i v11 reali):
+    // posizione assoluta = entry_offset + start. Ogni blocco decomprime a
+    // block_size, l'ultimo al resto. Usare gli offset (non la lettura contigua)
+    // rispetta l'eventuale padding di allineamento.
+    let base = entry_offset as usize;
+    let mut out = Vec::with_capacity(uncompressed as usize);
+    for (s, e) in &blocks {
+        let cs = base + *s as usize;
+        let ce = base + *e as usize;
+        if ce > data.len() || ce < cs { return Err("blocco fuori range".into()); }
+        let comp = &data[cs..ce];
+        let done = out.len() as u64;
+        let want = if block_size > 0 {
+            std::cmp::min(block_size, uncompressed - done)
+        } else {
+            uncompressed - done
+        } as usize;
+        let dec = pak_decompress_block(comp, want, &m, oodle)?;
+        out.extend_from_slice(&dec);
+    }
+    if out.len() as u64 != uncompressed {
+        log::warn!("pak: decompressi {} byte, attesi {}", out.len(), uncompressed);
+    }
+    Ok(out)
+}
+
+fn pak_decompress_block(comp: &[u8], want: usize, method: &str, oodle: &Option<OodleLib>) -> Result<Vec<u8>, String> {
+    if method.contains("oodle") || method == "mermaid" || method == "kraken" || method == "leviathan" || method == "selkie" {
+        match oodle {
+            Some(lib) => lib.decompress(comp, want),
+            None => Err("blocco Oodle ma DLL non disponibile".into()),
+        }
+    } else if method.contains("zlib") {
+        use flate2::read::ZlibDecoder;
+        use std::io::Read;
+        let mut d = ZlibDecoder::new(comp);
+        let mut v = Vec::new();
+        d.read_to_end(&mut v).map_err(|e| format!("zlib: {}", e))?;
+        Ok(v)
+    } else if method.contains("gzip") {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+        let mut d = GzDecoder::new(comp);
+        let mut v = Vec::new();
+        d.read_to_end(&mut v).map_err(|e| format!("gzip: {}", e))?;
+        Ok(v)
+    } else {
+        Err(format!("metodo compressione pak non gestito: {}", method))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    // ── Helpers ─────────────────────────────────────────────────────────
+    fn put_fstring(buf: &mut Vec<u8>, s: &str) {
+        if s.is_empty() {
+            buf.extend_from_slice(&0i32.to_le_bytes());
+            return;
+        }
+        let len = (s.len() + 1) as i32; // include null
+        buf.extend_from_slice(&len.to_le_bytes());
+        buf.extend_from_slice(s.as_bytes());
+        buf.push(0);
+    }
+
+    // ── Helper binari ───────────────────────────────────────────────────
+    #[test]
+    fn read_integers_round_trip() {
+        let mut buf = Vec::new();
+        buf.push(0xAB);
+        buf.extend_from_slice(&0x1234_5678u32.to_le_bytes());
+        buf.extend_from_slice(&(-5i32).to_le_bytes());
+        buf.extend_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
+        let mut off = 0;
+        assert_eq!(read_u8(&buf, &mut off).unwrap(), 0xAB);
+        assert_eq!(read_u32(&buf, &mut off).unwrap(), 0x1234_5678);
+        assert_eq!(read_i32(&buf, &mut off).unwrap(), -5);
+        assert_eq!(read_u64(&buf, &mut off).unwrap(), 0x1122_3344_5566_7788);
+    }
+
+    #[test]
+    fn read_u32_eof_errors() {
+        let mut off = 0;
+        assert!(read_u32(&[1, 2], &mut off).is_err());
+    }
+
+    #[test]
+    fn fstring_utf8_and_empty() {
+        let mut buf = Vec::new();
+        put_fstring(&mut buf, "Ciao");
+        put_fstring(&mut buf, "");
+        let mut off = 0;
+        assert_eq!(read_fstring(&buf, &mut off).unwrap(), "Ciao");
+        assert_eq!(read_fstring(&buf, &mut off).unwrap(), "");
+    }
+
+    #[test]
+    fn try_read_fstring_at_handles_cases() {
+        let mut buf = Vec::new();
+        put_fstring(&mut buf, "Testo");
+        let mut off = 0;
+        assert_eq!(try_read_fstring_at(&buf, &mut off), Some("Testo".to_string()));
+        // Senza null terminator → None
+        let mut bad = Vec::new();
+        bad.extend_from_slice(&3i32.to_le_bytes());
+        bad.extend_from_slice(b"abc"); // niente null finale
+        let mut off2 = 0;
+        assert_eq!(try_read_fstring_at(&bad, &mut off2), None);
+    }
+
+    // ── Euristiche testo ────────────────────────────────────────────────
+    #[test]
+    fn is_translatable_text_filters() {
+        assert!(is_translatable_text("Hello world"));
+        assert!(is_translatable_text("Press start to play."));
+        assert!(!is_translatable_text("SKILL_NAME_TEMP")); // ID tecnico maiuscolo
+        assert!(!is_translatable_text("LocalizationItemData")); // CamelCase interno
+        assert!(!is_translatable_text("Content/UI/Foo")); // path
+        assert!(!is_translatable_text("0xFF00")); // hex
+        assert!(!is_translatable_text("Hi")); // troppo poche lettere
+    }
+
+    #[test]
+    fn split_on_id_boundaries_separates_text() {
+        let parts = split_on_id_boundaries("Bolt cuttersIT_TO_THANDLEWRENCH");
+        assert!(parts.iter().any(|p| p == "Bolt cutters"));
+    }
+
+    #[test]
+    fn clean_datatable_string_returns_segments() {
+        let out = clean_datatable_string("Hello world");
+        assert!(out.iter().any(|s| s == "Hello world"));
+    }
+
+    // ── scan_ftext_entries ──────────────────────────────────────────────
+    #[test]
+    fn scan_ftext_finds_base_entry() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0u32.to_le_bytes()); // FText flags
+        buf.push(0u8); // history_type Base
+        put_fstring(&mut buf, "GameNS");
+        put_fstring(&mut buf, "KEY_01");
+        put_fstring(&mut buf, "Hello there, traveler");
+        buf.push(0); // padding finale
+
+        let entries = scan_ftext_entries(&buf);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "GameNS");
+        assert_eq!(entries[0].1, "KEY_01");
+        assert_eq!(entries[0].2, "Hello there, traveler");
+    }
+
+    // ── scan_uasset_strings ─────────────────────────────────────────────
+    #[test]
+    fn scan_uasset_strings_extracts_translatable() {
+        let mut buf = Vec::new();
+        put_fstring(&mut buf, "Hello world");
+        put_fstring(&mut buf, "Press start now");
+        let entries = scan_uasset_strings(&buf, "MyTable");
+        let values: Vec<&str> = entries.iter().map(|e| e.value.as_str()).collect();
+        assert!(values.contains(&"Hello world"));
+        assert!(values.contains(&"Press start now"));
+        assert!(entries.iter().all(|e| e.namespace == "MyTable"));
+    }
+
+    // ── parse_utoc_header (sintetico v3) ────────────────────────────────
+    #[test]
+    fn parse_utoc_header_reads_fields() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(UTOC_MAGIC); // 16
+        buf.push(3u8); // version 3 (< 4: niente PerfectHash)
+        buf.extend_from_slice(&[0u8; 3]); // reserved
+        buf.extend_from_slice(&144u32.to_le_bytes()); // header_size
+        buf.extend_from_slice(&5u32.to_le_bytes()); // entry_count
+        buf.extend_from_slice(&2u32.to_le_bytes()); // compressed_block_entry_count
+        buf.extend_from_slice(&12u32.to_le_bytes()); // compressed_block_entry_size
+        buf.extend_from_slice(&1u32.to_le_bytes()); // compression_method_name_count
+        buf.extend_from_slice(&32u32.to_le_bytes()); // compression_method_name_length
+        buf.extend_from_slice(&65536u32.to_le_bytes()); // compression_block_size
+        buf.extend_from_slice(&0u32.to_le_bytes()); // directory_index_size
+        buf.extend_from_slice(&1u32.to_le_bytes()); // partition_count
+        buf.extend_from_slice(&0xABCDu64.to_le_bytes()); // container_id
+        buf.extend_from_slice(&[0u8; 16]); // guid
+        buf.push(0u8); // container_flags
+        buf.resize(144, 0); // pad alla dimensione minima
+
+        let h = parse_utoc_header(&buf).unwrap();
+        assert_eq!(h.version, 3);
+        assert_eq!(h.entry_count, 5);
+        assert_eq!(h.partition_count, 1);
+        assert_eq!(h.container_id, 0xABCD);
+        assert_eq!(h.directory_index_size, 0);
+    }
+
+    #[test]
+    fn parse_utoc_header_rejects_bad_magic() {
+        let buf = vec![0u8; 200];
+        assert!(parse_utoc_header(&buf).is_err());
+    }
+
+    // ── parse_directory_index (sintetico) ───────────────────────────────
+    #[test]
+    fn parse_directory_index_builds_file_paths() {
+        const INVALID: u32 = 0xFFFFFFFF;
+        let mut buf = Vec::new();
+        put_fstring(&mut buf, "/"); // mount point
+        // 1 directory (root, senza nome)
+        buf.extend_from_slice(&1u32.to_le_bytes()); // dir_count
+        buf.extend_from_slice(&INVALID.to_le_bytes()); // name (root = nessuno)
+        buf.extend_from_slice(&INVALID.to_le_bytes()); // first_child
+        buf.extend_from_slice(&INVALID.to_le_bytes()); // next_sibling
+        buf.extend_from_slice(&0u32.to_le_bytes()); // first_file = 0
+        // 1 file
+        buf.extend_from_slice(&1u32.to_le_bytes()); // file_count
+        buf.extend_from_slice(&0u32.to_le_bytes()); // name = string[0]
+        buf.extend_from_slice(&INVALID.to_le_bytes()); // next_file
+        buf.extend_from_slice(&42u32.to_le_bytes()); // user_data (toc entry)
+        // string table
+        buf.extend_from_slice(&1u32.to_le_bytes()); // string_count
+        put_fstring(&mut buf, "Game.locres");
+
+        let files = parse_directory_index(&buf).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "Game.locres");
+        assert_eq!(files[0].toc_entry_index, 42);
+    }
+
+    // ── find_utoc_files ─────────────────────────────────────────────────
+    #[test]
+    fn find_utoc_files_scans_content_paks() {
+        let tmp = TempDir::new().unwrap();
+        let paks = tmp.path().join("MyGame/Content/Paks");
+        fs::create_dir_all(&paks).unwrap();
+        fs::write(paks.join("pakchunk0.utoc"), b"x").unwrap();
+        fs::write(paks.join("pakchunk0.ucas"), b"x").unwrap();
+        let found = find_utoc_files(tmp.path());
+        assert_eq!(found.len(), 1);
+        assert!(found[0].to_string_lossy().ends_with(".utoc"));
+    }
+
+    /// REGRESSIONE 19/08/2026 — The Skin Stapler (Steam).
+    /// Il gioco annida due livelli prima di Content/Paks:
+    /// `<install>/TheSkinStapler/TheSkinStapler/Content/Paks`.
+    /// I finder guardavano un livello solo, tornavano vuoti, e
+    /// `extract_iostore_localization` usciva con «Nessun file .utoc trovato»
+    /// senza mai arrivare al fallback sui .pak. Il gioco ha 1007 stringhe.
+    #[test]
+    fn find_utoc_files_trova_paks_annidata_due_livelli() {
+        let tmp = TempDir::new().unwrap();
+        let paks = tmp.path().join("TheSkinStapler/TheSkinStapler/Content/Paks");
+        fs::create_dir_all(&paks).unwrap();
+        fs::write(paks.join("TheSkinStapler-Windows.utoc"), b"x").unwrap();
+        fs::write(paks.join("TheSkinStapler-Windows.ucas"), b"x").unwrap();
+        let found = find_utoc_files(tmp.path());
+        assert_eq!(found.len(), 1, "la Paks a due livelli deve essere trovata");
+    }
+
+    /// Estrazione vera contro un gioco installato. Ignorato di default: serve
+    /// un gioco reale su disco, non un fixture. Si lancia a mano quando si
+    /// tocca la catena di rilevamento, ed è il solo modo di verificarla senza
+    /// far partire una traduzione (che costerebbe chiamate API sul serio):
+    ///
+    /// ```text
+    /// GS_UE_GAME_PATH="C:/…/steamapps/common/TheSkinStapler"     ///   cargo test --lib -- --ignored estrazione_su_gioco_reale --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore]
+    async fn estrazione_su_gioco_reale() {
+        let Ok(game) = std::env::var("GS_UE_GAME_PATH") else {
+            eprintln!("GS_UE_GAME_PATH non impostata: niente da fare");
+            return;
+        };
+        let utocs = find_utoc_files(Path::new(&game));
+        let paks = find_pak_files(Path::new(&game));
+        eprintln!("utoc trovati: {} · pak trovati: {}", utocs.len(), paks.len());
+        assert!(!utocs.is_empty() || !paks.is_empty(), "nessun container né pak: i finder non arrivano alla cartella Paks");
+
+        let res = extract_iostore_localization(game.clone()).await;
+        match res {
+            Ok(r) => {
+                eprintln!("stringhe estratte: {} · da: {}", r.entries.len(), r.locres_path);
+                if let Some(e) = r.entries.iter().find(|e| e.value.len() > 20) {
+                    eprintln!("esempio: {:?}", e.value);
+                }
+                assert!(!r.entries.is_empty(), "estrazione vuota su un gioco che ha testo");
+            }
+            Err(e) => panic!("estrazione fallita: {}", e),
+        }
+    }
+
+    // ── PAK CIFRATI ─────────────────────────────────────────────────────
+
+    /// Le due forme che usano i tool del settore (`repak --aes-key` accetta
+    /// entrambe) devono dare la stessa chiave.
+    #[test]
+    fn parse_aes_key_accetta_hex_e_base64() {
+        let atteso: [u8; 32] = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98,
+            0x76, 0x54, 0x32, 0x10,
+        ];
+        let hex: String = atteso.iter().map(|b| format!("{:02x}", b)).collect();
+        assert_eq!(parse_aes_key(&hex).unwrap(), atteso, "esadecimale");
+        assert_eq!(parse_aes_key(&format!("0x{}", hex)).unwrap(), atteso, "prefisso 0x");
+
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(atteso);
+        assert_eq!(parse_aes_key(&b64).unwrap(), atteso, "base64");
+        assert_eq!(parse_aes_key(&format!("  {}  ", b64)).unwrap(), atteso, "con spazi attorno");
+    }
+
+    /// REGRESSIONE: '0' e 'x' sono caratteri base64 validi, quindi una chiave
+    /// base64 legittima può cominciare per "0x". Togliere il prefisso sempre la
+    /// mutilava e l'utente si sentiva dire che la sua chiave giusta non era né
+    /// esadecimale né base64. Capita a circa 1 chiave su 2500.
+    #[test]
+    fn parse_aes_key_non_mutila_le_base64_che_iniziano_per_0x() {
+        use base64::Engine;
+        // Costruita per cominciare davvero con "0x" una volta codificata.
+        let mut trovata = None;
+        for seme in 0u8..=255 {
+            let raw: [u8; 32] = std::array::from_fn(|i| seme.wrapping_mul(31).wrapping_add(i as u8 * 7));
+            let b64 = base64::engine::general_purpose::STANDARD.encode(raw);
+            if b64.starts_with("0x") || b64.starts_with("0X") {
+                trovata = Some((raw, b64));
+                break;
+            }
+        }
+        let Some((raw, b64)) = trovata else {
+            eprintln!("nessun seme ha prodotto un base64 con prefisso 0x: test saltato");
+            return;
+        };
+        assert_eq!(parse_aes_key(&b64).unwrap(), raw, "la chiave base64 non va mutilata");
+    }
+
+    /// Il prefisso esadecimale deve continuare a funzionare.
+    #[test]
+    fn parse_aes_key_toglie_0x_solo_dall_esadecimale() {
+        let atteso = [0xABu8; 32];
+        let hex: String = atteso.iter().map(|b| format!("{:02x}", b)).collect();
+        assert_eq!(parse_aes_key(&format!("0x{}", hex)).unwrap(), atteso);
+        assert_eq!(parse_aes_key(&format!("0X{}", hex)).unwrap(), atteso);
+    }
+
+    /// REGRESSIONE: `-len` su i32::MIN va in overflow e in debug fa panicare.
+    /// Con una chiave sbagliata i byte decifrati sono casuali, quindi quel
+    /// valore prima o poi esce.
+    #[test]
+    fn key_opens_pak_index_non_panica_su_i32_min() {
+        use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
+        let mut chiaro = i32::MIN.to_le_bytes().to_vec();
+        chiaro.resize(32, 0);
+        let key: [u8; 32] = [0x5C; 32];
+        let mut cifrato = chiaro.clone();
+        let cipher = aes::Aes256::new(GenericArray::from_slice(&key));
+        for b in cifrato.chunks_exact_mut(16) {
+            cipher.encrypt_block(GenericArray::from_mut_slice(b));
+        }
+        let mut data = vec![0u8; 16];
+        let index_offset = data.len() as u64;
+        data.extend_from_slice(&cifrato);
+        let footer = PakFooter {
+            version: 11,
+            index_offset,
+            index_size: 32,
+            compression_methods: vec![],
+            encrypted_index: true,
+        };
+        // Non deve panicare: deve semplicemente dire «non è la chiave giusta».
+        assert!(!key_opens_pak_index(&data, &footer, &key));
+    }
+
+    /// Una chiave incollata male deve fallire subito e con un motivo leggibile,
+    /// non più tardi dentro il parser dell'indice.
+    #[test]
+    fn parse_aes_key_rifiuta_input_sbagliati() {
+        assert!(parse_aes_key("").is_err());
+        assert!(parse_aes_key("non-una-chiave").is_err());
+        // 16 byte: AES-128, non basta per un pak UE.
+        use base64::Engine;
+        let corta = base64::engine::general_purpose::STANDARD.encode([7u8; 16]);
+        let err = parse_aes_key(&corta).unwrap_err();
+        assert!(err.contains("32 byte"), "il messaggio deve dire quanti byte servono: {err}");
+    }
+
+    /// Il validatore deve distinguere la chiave giusta da una sbagliata usando
+    /// il mount point che apre l'indice. Senza questo, una chiave errata
+    /// produrrebbe byte casuali e un parse fallito 200 righe più in là.
+    #[test]
+    fn key_opens_pak_index_riconosce_la_chiave_giusta() {
+        use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
+
+        // Indice in chiaro: FString del mount point "../../../" + NUL.
+        let mount = b"../../../\0";
+        let mut chiaro = Vec::new();
+        chiaro.extend_from_slice(&(mount.len() as i32).to_le_bytes());
+        chiaro.extend_from_slice(mount);
+        chiaro.resize(32, 0);
+
+        let giusta: [u8; 32] = [0xA5; 32];
+        let mut cifrato = chiaro.clone();
+        let cipher = aes::Aes256::new(GenericArray::from_slice(&giusta));
+        for blocco in cifrato.chunks_exact_mut(16) {
+            cipher.encrypt_block(GenericArray::from_mut_slice(blocco));
+        }
+
+        // Il pak finto: 64 byte di riempimento, poi l'indice cifrato.
+        let mut data = vec![0u8; 64];
+        let index_offset = data.len() as u64;
+        data.extend_from_slice(&cifrato);
+
+        let footer = PakFooter {
+            version: 11,
+            index_offset,
+            index_size: chiaro.len() as u64,
+            compression_methods: vec![],
+            encrypted_index: true,
+        };
+
+        assert!(key_opens_pak_index(&data, &footer, &giusta), "la chiave giusta deve aprire");
+        assert!(!key_opens_pak_index(&data, &footer, &[0x11; 32]), "una chiave sbagliata non deve passare");
+    }
+
+    /// Stessa profondità, lato .pak: è lì che stanno i .locres nei giochi
+    /// UE5 IoStore, quindi se il finder non ci arriva il testo resta invisibile.
+    /// I nostri override (_P.pak, GameStringer*) restano esclusi.
+    #[test]
+    fn find_pak_files_trova_annidati_ed_esclude_i_nostri() {
+        let tmp = TempDir::new().unwrap();
+        let paks = tmp.path().join("Gioco/Sub/Content/Paks");
+        fs::create_dir_all(&paks).unwrap();
+        fs::write(paks.join("Gioco-Windows.pak"), b"x").unwrap();
+        fs::write(paks.join("GameStringer_it_P.pak"), b"x").unwrap();
+        fs::write(paks.join("Altro_P.pak"), b"x").unwrap();
+        let found = find_pak_files(tmp.path());
+        assert_eq!(found.len(), 1, "solo il pak originale del gioco");
+        assert!(found[0].to_string_lossy().ends_with("Gioco-Windows.pak"));
+    }
+
+    // ── WRITE PATH ──────────────────────────────────────────────────────
+
+    /// patch_uasset_binary deve sostituire la stringa e riscrivere il prefisso
+    /// di lunghezza quando la traduzione è più lunga dell'originale (a differenza
+    /// del patcher GameMaker, qui il file può crescere).
+    #[test]
+    fn patch_uasset_grows_string_and_rewrites_length_prefix() {
+        // Nessun magic UAsset → data_offset = 0, si scansiona tutto il buffer.
+        let mut buf = Vec::new();
+        put_fstring(&mut buf, "Hello");
+        let original_len = buf.len();
+
+        let mut repl = std::collections::HashMap::new();
+        repl.insert("Hello".to_string(), "Ciao Mondo".to_string());
+
+        let out = patch_uasset_binary(&buf, &repl);
+
+        // La nuova stringa è presente…
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("Ciao Mondo"), "traduzione non scritta: {text:?}");
+        assert!(!text.contains("Hello"), "originale non sostituito");
+        // …il buffer è cresciuto di 5 byte ("Ciao Mondo" 10 vs "Hello" 5)…
+        assert_eq!(out.len(), original_len + 5);
+        // …e il prefisso di lunghezza in testa vale len(testo)+1 (null incluso).
+        let new_len = i32::from_le_bytes([out[0], out[1], out[2], out[3]]);
+        assert_eq!(new_len, ("Ciao Mondo".len() + 1) as i32);
+        assert_eq!(*out.last().unwrap(), 0, "manca il null terminator");
+    }
+
+    /// Le stringhe non presenti nella mappa restano intatte.
+    #[test]
+    fn patch_uasset_leaves_unmatched_strings_untouched() {
+        let mut buf = Vec::new();
+        put_fstring(&mut buf, "Keep me");
+        let repl = std::collections::HashMap::new(); // vuota
+        let out = patch_uasset_binary(&buf, &repl);
+        assert_eq!(out, buf);
+    }
+
+    /// Il container generato ha header valido, i ChunkMeta (33 byte l'uno) e
+    /// l'UCAS con i dati grezzi; ChunkHash a zeri come da scelta documentata.
+    #[test]
+    fn create_iostore_container_layout_v5() {
+        let chunk_id = [1u8; 12];
+        let file_data: &[u8] = b"ABCDE";
+        let entries: Vec<(&[u8; 12], &[u8])> = vec![(&chunk_id, file_data)];
+
+        let (utoc, ucas) = create_iostore_container(&entries, 5, 65536, 0, 0xDEAD_BEEF);
+
+        // UCAS = dati grezzi (non compressi)
+        assert_eq!(ucas, file_data);
+
+        // Header
+        assert_eq!(&utoc[0..16], UTOC_MAGIC);
+        assert_eq!(utoc[16], 5, "version byte");
+        let entry_count = u32::from_le_bytes([utoc[24], utoc[25], utoc[26], utoc[27]]);
+        assert_eq!(entry_count, 1);
+
+        // Gli ultimi entry_count*33 byte sono i ChunkMeta: 32 di hash a zero + 1 flag.
+        let meta = &utoc[utoc.len() - 33..];
+        assert_eq!(&meta[0..32], &[0u8; 32], "ChunkHash deve essere zeri (vedi nota)");
+        assert_eq!(meta[32], 0, "Flags = None per dati non compressi");
+    }
+
+    /// Una UTOC con versione oltre quella nota si legge comunque best-effort
+    /// (nessun errore fatale) — è ciò che consente ai giochi UE 5.4+ di aprirsi.
+    #[test]
+    fn parse_utoc_header_accepts_newer_version_best_effort() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(UTOC_MAGIC);
+        buf.push(7u8); // versione oltre UTOC_MAX_KNOWN_VERSION
+        buf.extend_from_slice(&[0u8; 3]);
+        buf.extend_from_slice(&144u32.to_le_bytes()); // header_size
+        buf.extend_from_slice(&3u32.to_le_bytes());   // entry_count
+        buf.extend_from_slice(&1u32.to_le_bytes());   // compressed_block_entry_count
+        buf.extend_from_slice(&12u32.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&32u32.to_le_bytes());
+        buf.extend_from_slice(&65536u32.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes());   // partition_count
+        buf.extend_from_slice(&0x99u64.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 16]);
+        buf.push(0u8);
+        buf.resize(200, 0);
+
+        let h = parse_utoc_header(&buf).expect("versione recente deve leggersi best-effort");
+        assert_eq!(h.version, 7);
+        assert_eq!(h.entry_count, 3);
+        assert!(h.version > UTOC_MAX_KNOWN_VERSION);
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Corpus reale — punto 6 dell'ADR-002
+    //
+    // «I test attuali sono tutti sintetici; non esiste una fixture da gioco
+    // reale.» Un container sintetico dimostra che il parser legge quello che
+    // il parser stesso ha scritto: è un'eco, non una verifica. Questi test
+    // girano su un `.utoc` di un gioco vero e riportano NUMERI, perché la
+    // domanda non è «il codice non va in panico» ma «quante stringhe
+    // traducibili esistono davvero là dentro».
+    //
+    //   GS_UE_UTOC="C:/.../Content/Paks/pakchunk0-Windows.utoc" \
+    //     cargo test --lib -- --ignored --nocapture utoc_reale
+    //
+    // Il .ucas deve stare accanto al .utoc, come nel gioco installato.
+    // ══════════════════════════════════════════════════════════════════
+
+    fn utoc_dal_ambiente() -> Option<std::path::PathBuf> {
+        match std::env::var("GS_UE_UTOC") {
+            Ok(p) if !p.trim().is_empty() => Some(std::path::PathBuf::from(p)),
+            _ => {
+                eprintln!("GS_UE_UTOC non impostata: niente da fare");
+                None
+            }
+        }
+    }
+
+    /// Il layout conosciuto regge su un container più recente della v5?
+    ///
+    /// Lo scanner `scripts/ue-inspect-games.js` dice di sì su UTOC v6 e v8
+    /// (29/07/2026, Beyond Hanwell e Oneirophobia Demo), ma lo dice con una
+    /// reimplementazione in JavaScript. Qui a leggere è il codice VERO, quello
+    /// che gira in produzione.
+    #[test]
+    #[ignore = "richiede GS_UE_UTOC con il percorso di un .utoc reale"]
+    fn utoc_reale_header_e_indice() {
+        let Some(percorso) = utoc_dal_ambiente() else { return };
+        let dati = std::fs::read(&percorso).expect("impossibile leggere il .utoc");
+        eprintln!("\n{}: {} byte", percorso.display(), dati.len());
+
+        let header = parse_utoc_header(&dati).expect("header UTOC non parsabile");
+        eprintln!(
+            "UTOC v{} · {} entry · {} blocchi · {} partizioni · blocco {} B",
+            header.version, header.entry_count, header.compressed_block_entry_count,
+            header.partition_count, header.compression_block_size
+        );
+        if header.version > UTOC_MAX_KNOWN_VERSION {
+            eprintln!(
+                "  (v{} è oltre la v{} dichiarata come testata: è proprio il caso da verificare)",
+                header.version, UTOC_MAX_KNOWN_VERSION
+            );
+        }
+
+        let (offsets, blocchi, metodi, files) =
+            parse_utoc_data(&dati, &header).expect("sezioni UTOC non parsabili");
+
+        eprintln!("compressione: {:?}", metodi);
+        eprintln!("file nell'indice: {}", files.len());
+
+        assert_eq!(offsets.len(), header.entry_count as usize,
+            "un OffsetAndLength per entry: se non torna, il layout è diverso");
+        assert_eq!(blocchi.len(), header.compressed_block_entry_count as usize,
+            "i blocchi compressi non corrispondono all'header");
+
+        // Il container global non ha indice: è normale e non va preteso.
+        let e_global = percorso.file_name()
+            .map(|n| n.to_string_lossy().to_lowercase().contains("global"))
+            .unwrap_or(false);
+        if e_global {
+            eprintln!("container global: nessun indice atteso");
+            return;
+        }
+
+        assert!(!files.is_empty(), "indice vuoto su un container che dovrebbe averlo");
+
+        // I percorsi devono essere testo, non byte a caso: è la prova che gli
+        // offset delle sezioni sono giusti.
+        let leggibili = files.iter()
+            .filter(|f| !f.path.is_empty() && f.path.is_ascii() && !f.path.contains('\u{0}'))
+            .count();
+        let quota = leggibili as f64 / files.len() as f64;
+        eprintln!("percorsi leggibili: {}/{} ({:.1}%)", leggibili, files.len(), quota * 100.0);
+        for f in files.iter().take(5) {
+            eprintln!("  {}", f.path);
+        }
+        assert!(quota > 0.95,
+            "solo il {:.1}% dei percorsi è leggibile: il layout NON regge su UTOC v{}",
+            quota * 100.0, header.version);
+
+        // Che cosa c'è dentro, per estensione: decide che cosa è traducibile.
+        let mut per_est: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for f in &files {
+            if let Some(e) = f.path.rsplit('.').next() {
+                *per_est.entry(e.to_lowercase()).or_insert(0) += 1;
+            }
+        }
+        let mut classifica: Vec<_> = per_est.into_iter().collect();
+        classifica.sort_by(|a, b| b.1.cmp(&a.1));
+        eprintln!("estensioni: {:?}", &classifica[..classifica.len().min(8)]);
+
+        let locres = files.iter().filter(|f| f.path.ends_with(".locres")).count();
+        eprintln!("\n.locres nel container: {}", locres);
+        if locres == 0 {
+            eprintln!(
+                "  NESSUN .locres: il gioco non usa la localizzazione di Unreal.\n\
+                   I testi stanno nei .uasset, ed è il caso degli indie UE5\n\
+                   nati in una lingua sola — cioè quelli che gli utenti\n\
+                   chiedono di tradurre."
+            );
+        }
+    }
+
+    /// Quante stringhe TRADUCIBILI si tirano fuori davvero.
+    ///
+    /// Estrae un campione di `.uasset` dal `.ucas` (decomprimendo per davvero,
+    /// Oodle incluso) e ci passa sopra lo scanner di produzione. Serve a
+    /// distinguere due cose che da fuori si somigliano: «il gioco non ha
+    /// testo» e «il nostro estrattore non lo trova».
+    #[test]
+    #[ignore = "richiede GS_UE_UTOC e la DLL Oodle del gioco"]
+    fn utoc_reale_quante_stringhe_si_estraggono() {
+        let Some(percorso) = utoc_dal_ambiente() else { return };
+        let dati = std::fs::read(&percorso).expect("impossibile leggere il .utoc");
+        let header = parse_utoc_header(&dati).expect("header UTOC non parsabile");
+        let (offsets, blocchi, metodi, files) =
+            parse_utoc_data(&dati, &header).expect("sezioni UTOC non parsabili");
+
+        let ucas = percorso.with_extension("ucas");
+        if !ucas.exists() {
+            eprintln!("{}: manca il .ucas accanto al .utoc", ucas.display());
+            return;
+        }
+
+        // Oodle: senza, i blocchi compressi non si aprono e il test non può
+        // dire niente di utile. Va detto invece di far finta.
+        let oodle = match OodleLib::load() {
+            Ok(o) => Some(o),
+            Err(e) => {
+                eprintln!("Oodle non caricata ({e}).");
+                if metodi.iter().any(|m| m.to_lowercase().contains("oodle")) {
+                    eprintln!("Il container USA Oodle: senza la DLL questo test non prova nulla.");
+                    return;
+                }
+                None
+            }
+        };
+
+        let candidati: Vec<_> = files.iter()
+            .filter(|f| f.path.ends_with(".uasset") || f.path.ends_with(".locres"))
+            .take(40)
+            .collect();
+        eprintln!("\ncampione: {} file su {} nell'indice", candidati.len(), files.len());
+
+        let (mut estratti, mut falliti, mut totale_stringhe) = (0usize, 0usize, 0usize);
+        let mut esempi: Vec<String> = Vec::new();
+
+        for f in &candidati {
+            match extract_file_from_ucas(
+                &ucas, f.toc_entry_index as usize, &offsets, &blocchi,
+                &metodi, header.compression_block_size, &oodle,
+            ) {
+                Ok(contenuto) => {
+                    estratti += 1;
+                    let trovate = scan_uasset_strings(&contenuto, &f.path);
+                    totale_stringhe += trovate.len();
+                    for e in trovate.iter().take(2) {
+                        if esempi.len() < 10 {
+                            esempi.push(format!("{}: {}", f.path.rsplit('/').next().unwrap_or(""), e.value));
+                        }
+                    }
+                }
+                Err(e) => {
+                    falliti += 1;
+                    if falliti <= 3 {
+                        eprintln!("  estrazione fallita su {}: {}", f.path, e);
+                    }
+                }
+            }
+        }
+
+        eprintln!("estratti: {estratti} · falliti: {falliti} · stringhe traducibili: {totale_stringhe}");
+        for e in &esempi {
+            eprintln!("  · {e}");
+        }
+
+        assert!(estratti > 0,
+            "nessun file estratto su {} tentativi: la decompressione non funziona \
+             su questo container (v{})", candidati.len(), header.version);
+    }
+
+    /// Diagnosi END-TO-END dell'estrazione come la vede la UI: chiama la funzione
+    /// vera `extract_iostore_localization` sulla CARTELLA del gioco (non un singolo
+    /// .utoc), così misura scelta+aggregazione dei .locres. Isola il problema dai
+    /// pulsanti del frontend.
+    ///
+    ///   GS_UE_GAME_DIR="C:/Program Files (x86)/Steam/steamapps/common/<CartellaGioco>" \
+    ///     cargo test --lib below_estrazione_completa -- --ignored --nocapture
+    ///
+    /// (la DLL Oodle va in %APPDATA%/GameStringer/tools/oo2core_9_win64.dll)
+    #[test]
+    #[ignore = "richiede GS_UE_GAME_DIR = cartella gioco + DLL Oodle"]
+    fn below_estrazione_completa() {
+        let Ok(game) = std::env::var("GS_UE_GAME_DIR") else {
+            eprintln!("GS_UE_GAME_DIR non impostata: niente da fare");
+            return;
+        };
+        let res = match tauri::async_runtime::block_on(extract_iostore_localization(game)) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("\n❌ extract_iostore_localization ha restituito ERRORE:\n   {e}");
+                panic!("estrazione fallita: {e}");
+            }
+        };
+        eprintln!("\n=== ESITO ===");
+        eprintln!("messaggio : {}", res.message);
+        eprintln!("locres    : {}", res.locres_path);
+        eprintln!("STRINGHE  : {}", res.entries.len());
+        for e in res.entries.iter().take(10) {
+            let v: String = e.value.chars().take(60).collect();
+            eprintln!("  [{}] {} = {}", e.namespace, e.key, v);
+        }
+        assert!(res.entries.len() > 100,
+            "attese >100 stringhe (Game.locres ne ha ~752), trovate solo {}",
+            res.entries.len());
+    }
+
+    /// Isola il PAK READER: estrae i .locres direttamente dal .pak e stampa,
+    /// per ciascuno, byte + versione + conteggio + esempi. Serve a validare il
+    /// formato pak sul file vero, senza il resto della pipeline.
+    ///
+    ///   GS_UE_ORIG_PAK="C:/.../Content/Paks/<Gioco>-Windows.pak" \
+    ///     cargo test --lib below_pak_reader -- --ignored --nocapture
+    #[test]
+    #[ignore = "richiede GS_UE_ORIG_PAK + DLL Oodle"]
+    fn below_pak_reader() {
+        let Ok(pak) = std::env::var("GS_UE_ORIG_PAK") else {
+            eprintln!("GS_UE_ORIG_PAK non impostata: niente da fare");
+            return;
+        };
+        let oodle = OodleLib::load().ok();
+        eprintln!("Oodle: {}", if oodle.is_some() { "caricata" } else { "ASSENTE" });
+        let list = match extract_locres_from_pak(std::path::Path::new(&pak), &oodle) {
+            Ok(l) => l,
+            Err(e) => { eprintln!("\n❌ pak reader: {e}"); panic!("pak reader fallito: {e}"); }
+        };
+        eprintln!("\n=== {} .locres estratti dal pak ===", list.len());
+        let mut best = 0usize;
+        for l in &list {
+            match crate::commands::unreal_localization::parse_locres_pub(&l.data) {
+                Ok((v, e)) => {
+                    best = best.max(e.len());
+                    eprintln!("  {} : {} byte → v{} · {} stringhe", l.path, l.data.len(), v, e.len());
+                    if e.len() > 50 {
+                        for x in e.iter().take(3) {
+                            let val: String = x.value.chars().take(50).collect();
+                            eprintln!("       [{}] {} = {}", x.namespace, x.key, val);
+                        }
+                    }
+                }
+                Err(err) => eprintln!("  {} : {} byte → parse FALLITO: {}", l.path, l.data.len(), err),
+            }
+        }
+        assert!(best > 100, "il .locres più grande ha solo {} stringhe (atteso ~752)", best);
+    }
+
+    /// La domanda che conta davvero: la patch è TRADOTTA o è una copia dell'originale?
+    /// Confronta, chiave per chiave, il .locres del nostro _P.pak con quello del gioco.
+    /// Serve perché "patch attiva — N stringhe" non dice NIENTE sul contenuto: un pak
+    /// pieno di testo inglese si installa benissimo e il gioco resta in inglese senza
+    /// un errore. Stessa forma del "tradotto al 100%" che non cambiava niente a schermo.
+    ///
+    ///   GS_UE_ORIG_PAK="…/<Gioco>-Windows.pak" \
+    ///   GS_UE_PATCH_PAK="…/<Gioco>_GameStringer_it_P.pak" \
+    ///     cargo test --lib patch_e_davvero_tradotta -- --ignored --nocapture
+    #[test]
+    #[ignore = "richiede GS_UE_ORIG_PAK (originale) + GS_UE_PATCH_PAK (patch)"]
+    fn patch_e_davvero_tradotta() {
+        let (Ok(orig), Ok(patch)) = (std::env::var("GS_UE_ORIG_PAK"), std::env::var("GS_UE_PATCH_PAK")) else {
+            // panic, non return: un test --ignored lo si lancia apposta, e uscire
+            // con `ok` senza le variabili è a sua volta un fallimento muto —
+            // successo il 02/08, sembrava una misura ed era un no-op.
+            panic!("Servono GS_UE_ORIG_PAK e GS_UE_PATCH_PAK");
+        };
+        let oodle = OodleLib::load().ok();
+        let leggi = |p: &str, filtro: &str| -> Vec<(String, String)> {
+            let list = extract_locres_from_pak(std::path::Path::new(p), &oodle).unwrap_or_default();
+            for l in &list {
+                if l.path.to_lowercase().contains(filtro) {
+                    if let Ok((_, e)) = crate::commands::unreal_localization::parse_locres_pub(&l.data) {
+                        return e.into_iter().map(|x| (format!("{}|{}", x.namespace, x.key), x.value)).collect();
+                    }
+                }
+            }
+            Vec::new()
+        };
+        let a = leggi(&orig, "/en/");
+        let b = leggi(&patch, "/it/");
+        eprintln!("\noriginale (en): {} stringhe · patch (it): {} stringhe", a.len(), b.len());
+        if a.is_empty() || b.is_empty() { panic!("una delle due liste è vuota"); }
+
+        let mappa: std::collections::HashMap<_, _> = a.into_iter().collect();
+        let (mut uguali, mut diverse, mut mancanti) = (0usize, 0usize, 0usize);
+        let mut esempi = Vec::new();
+        for (k, v) in &b {
+            match mappa.get(k) {
+                Some(o) if o == v => uguali += 1,
+                Some(o) => {
+                    diverse += 1;
+                    if esempi.len() < 5 && o.len() > 12 {
+                        esempi.push(format!("  en: {}\n  it: {}", &o[..o.len().min(60)], &v[..v.len().min(60)]));
+                    }
+                }
+                None => mancanti += 1,
+            }
+        }
+        eprintln!("\n=== VERDETTO ===");
+        eprintln!("  DIVERSE dall'originale (tradotte) : {}", diverse);
+        eprintln!("  identiche all'originale           : {}", uguali);
+        eprintln!("  chiavi non presenti nell'originale: {}", mancanti);
+        for e in &esempi { eprintln!("{}", e); }
+        let perc = (diverse as f64) * 100.0 / (b.len().max(1) as f64);
+        eprintln!("\n  → {:.1}% del testo è cambiato", perc);
+        assert!(diverse > b.len() / 4,
+            "solo {} stringhe su {} differiscono dall'originale: la patch NON è tradotta",
+            diverse, b.len());
+    }
+
+    /// ESPERIMENTO travestimento: riconfeziona il _P.pak esistente spostando il
+    /// .locres italiano sotto la cartella di una cultura che il gioco CONOSCE
+    /// (default `es`). alcuni giochi hanno la lista lingue cablata nel menu: la cultura `it`
+    /// non è selezionabile, quindi il nostro override `it/` non viene mai chiesto.
+    /// Se col pak travestito il gioco impostato su Español mostra l'italiano, il
+    /// mount funziona e il problema era SOLO la registrazione della cultura; se
+    /// resta spagnolo, il pak non viene proprio montato (formato/versione) — due
+    /// diagnosi opposte, un solo esperimento.
+    ///
+    ///   GS_UE_PATCH_PAK="…/<Gioco>_GameStringer_it_P.pak" \
+    ///   [GS_UE_MASK_CULTURE=es] \
+    ///     cargo test --lib crea_pak_travestito -- --ignored --nocapture
+    ///
+    /// Scrive `<dir del pak>/<nome>_GameStringer_<cultura>mask_P.pak`. Poi:
+    /// rimuovere il _P.pak italiano (o no: convivono), avviare il gioco,
+    /// selezionare la lingua sacrificata nel menu.
+    #[tokio::test]
+    #[ignore = "richiede GS_UE_PATCH_PAK (pak italiano da travestire)"]
+    async fn crea_pak_travestito() {
+        let Ok(patch) = std::env::var("GS_UE_PATCH_PAK") else {
+            panic!("Serve GS_UE_PATCH_PAK (pak italiano esistente)");
+        };
+        let mask = std::env::var("GS_UE_MASK_CULTURE").unwrap_or_else(|_| "es".to_string());
+        assert!(mask != "it", "travestire it da it non è un esperimento");
+
+        let oodle = OodleLib::load().ok();
+        let list = extract_locres_from_pak(std::path::Path::new(&patch), &oodle)
+            .expect("pak italiano illeggibile col nostro stesso reader");
+        let it: Vec<&PakLocres> = list.iter().filter(|l| l.path.contains("/it/")).collect();
+        assert!(!it.is_empty(), "nessun .locres sotto /it/ nel pak: {} file letti", list.len());
+
+        // Stessi byte, path con la cultura maschera. Niente altro nel pak:
+        // l'esperimento deve avere UNA variabile sola.
+        let files: Vec<(String, Vec<u8>)> = it.iter()
+            .map(|l| (l.path.replace("/it/", &format!("/{}/", mask)), l.data.clone()))
+            .collect();
+        for (p, d) in &files {
+            eprintln!("  → {} ({} byte)", p, d.len());
+        }
+        let refs: Vec<(&str, &[u8])> = files.iter().map(|(p, d)| (p.as_str(), d.as_slice())).collect();
+
+        let src = std::path::Path::new(&patch);
+        let out = src.with_file_name(
+            src.file_name().unwrap().to_string_lossy().replace("_it_P.pak", &format!("_{}mask_P.pak", mask))
+        );
+        assert_ne!(src, out, "nome output identico all'input");
+        let r = crate::commands::repak_wrapper::create_pak(&refs, &out, None).await
+            .expect("creazione pak travestito fallita");
+        // Prova di effetto: rileggi il pak APPENA scritto e verifica che contenga
+        // il .locres sotto la cultura maschera — "file creato" non basta.
+        let verifica = extract_locres_from_pak(&out, &oodle).expect("pak travestito illeggibile");
+        let trovati = verifica.iter().filter(|l| l.path.contains(&format!("/{}/", mask))).count();
+        assert!(trovati > 0, "il pak travestito non contiene .locres sotto /{}/", mask);
+        eprintln!("\n✅ [{}] {} — {} .locres sotto /{}/. Ora: avvia il gioco e seleziona la lingua '{}' nel menu.",
+            r.method, out.display(), trovati, mask, mask);
+    }
+
+    /// ISPEZIONE indici: confronta punto per punto l'indice del pak del GIOCO
+    /// con quello del NOSTRO override. Dopo il travestimento es/ in formato
+    /// repak-V11 il gioco resta in spagnolo: le ipotesi plausibili sono finite,
+    /// e la differenza — mount point, forma dei path, metodi di compressione —
+    /// va LETTA dai byte, non dedotta.
+    ///
+    ///   GS_UE_PAK_A="…/<Gioco>-Windows.pak" \
+    ///   GS_UE_PAK_B="…/<Gioco>_GameStringer_esmask_P.pak" \
+    ///     cargo test --lib ispeziona_indice_pak -- --ignored --nocapture
+    #[test]
+    #[ignore = "richiede GS_UE_PAK_A e GS_UE_PAK_B"]
+    fn ispeziona_indice_pak() {
+        let (Ok(a), Ok(b)) = (std::env::var("GS_UE_PAK_A"), std::env::var("GS_UE_PAK_B")) else {
+            panic!("Servono GS_UE_PAK_A (pak del gioco) e GS_UE_PAK_B (nostro override)");
+        };
+        let oodle = OodleLib::load().ok();
+        for (etichetta, percorso) in [("GIOCO", &a), ("NOSTRO", &b)] {
+            eprintln!("\n════ {} — {} ════", etichetta, percorso);
+            let data = fs::read(percorso).expect("pak illeggibile");
+            eprintln!("  dimensione file : {} byte", data.len());
+            let footer = pak_read_footer(&data).expect("footer illeggibile");
+            eprintln!("  versione footer : {}", footer.version);
+            eprintln!("  indice cifrato  : {}", footer.encrypted_index);
+            eprintln!("  metodi compress.: {:?}", footer.compression_methods);
+            let io = footer.index_offset as usize;
+            let idx = &data[io..io + footer.index_size as usize];
+            let mut p = 0usize;
+            let mount = pak_read_fstring(idx, &mut p).expect("mount illeggibile");
+            // Il mount va stampato con i delimitatori: uno spazio o uno slash
+            // finale in più sono invisibili a occhio e decisivi per il motore.
+            eprintln!("  mount point     : ⟦{}⟧ (len {})", mount, mount.len());
+            let num = rd_u32(idx, &mut p).unwrap_or(0);
+            eprintln!("  num entries     : {}", num);
+            match extract_locres_from_pak(std::path::Path::new(percorso), &oodle) {
+                Ok(list) => {
+                    eprintln!("  .locres nell'indice: {}", list.len());
+                    for l in list.iter().take(15) {
+                        eprintln!("    ⟦{}⟧ ({} byte)", l.path, l.data.len());
+                    }
+                }
+                Err(e) => eprintln!("  ⚠️ estrazione: {}", e),
+            }
+        }
+        eprintln!("\nConfronto fatto A OCCHIO qui sopra: cerca differenze in mount (slash finale?),\nprefisso dei path (con/senza nome progetto?), maiuscole, separatori.");
+    }
+
+    /// Quanto si estrae SENZA la DLL Oodle.
+    ///
+    /// Misura del 29/07/2026 sui container reali: la quota di blocchi non
+    /// compressi va dal 2,6% al 6,4%, ma in valore assoluto sono gigabyte. La
+    /// percentuale però non risponde alla domanda utile — quei blocchi
+    /// contengono i `.uasset` col testo, o solo texture e audio?
+    ///
+    /// Un file è leggibile senza Oodle se TUTTI i blocchi che lo coprono sono
+    /// in chiaro (stessa regola di extract_file_from_ucas: indice 0, oppure
+    /// dimensione compressa uguale a quella non compressa).
+    ///
+    /// Il test non ha bisogno della DLL: passa `None` come Oodle, e se un file
+    /// richiedesse davvero la decompressione l'estrazione fallirebbe — il che
+    /// renderebbe il conteggio bugiardo, e infatti viene verificato.
+    #[test]
+    #[ignore = "richiede GS_UE_UTOC con il percorso di un .utoc reale"]
+    fn utoc_reale_quanto_si_legge_senza_oodle() {
+        let Some(percorso) = utoc_dal_ambiente() else { return };
+        let dati = std::fs::read(&percorso).expect("impossibile leggere il .utoc");
+        let header = parse_utoc_header(&dati).expect("header UTOC non parsabile");
+        let (offsets, blocchi, metodi, files) =
+            parse_utoc_data(&dati, &header).expect("sezioni UTOC non parsabili");
+
+        let bs = header.compression_block_size as u64;
+        assert!(bs > 0, "block size a zero: il container non ha senso");
+
+        let in_chiaro = |i: usize| -> bool {
+            match blocchi.get(i) {
+                Some(b) => b.compression_method_index == 0
+                    || b.compressed_size == b.uncompressed_size,
+                None => false,
+            }
+        };
+
+        // Un file è alla nostra portata se nessuno dei suoi blocchi è compresso.
+        let mut leggibili: Vec<&IoStoreFile> = Vec::new();
+        let mut per_estensione: std::collections::HashMap<String, (usize, usize)> =
+            std::collections::HashMap::new();
+
+        for f in &files {
+            let Some(oal) = offsets.get(f.toc_entry_index as usize) else { continue };
+            if oal.length == 0 { continue; }
+            let primo = (oal.offset / bs) as usize;
+            let ultimo = ((oal.offset + oal.length - 1) / bs) as usize;
+            let tutto_in_chiaro = (primo..=ultimo).all(in_chiaro);
+
+            let est = f.path.rsplit('.').next().unwrap_or("").to_lowercase();
+            let e = per_estensione.entry(est).or_insert((0, 0));
+            e.1 += 1;
+            if tutto_in_chiaro {
+                e.0 += 1;
+                leggibili.push(f);
+            }
+        }
+
+        eprintln!("\n=== senza la DLL Oodle ===");
+        eprintln!("file leggibili: {}/{}", leggibili.len(), files.len());
+        let mut classifica: Vec<_> = per_estensione.into_iter().collect();
+        classifica.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+        for (est, (ok, tot)) in classifica.iter().take(8) {
+            eprintln!("  .{:<16} {}/{}", est, ok, tot);
+        }
+
+        let uasset_leggibili: Vec<_> = leggibili.iter()
+            .filter(|f| f.path.ends_with(".uasset") || f.path.ends_with(".locres"))
+            .collect();
+        eprintln!("\n.uasset/.locres alla portata: {}", uasset_leggibili.len());
+
+        if uasset_leggibili.is_empty() {
+            eprintln!(
+                "NESSUNO: senza la DLL non si estrae un solo file con del testo.\n\
+                 Il percorso IoStore su questo gioco è bloccato in lettura, non\n\
+                 in scrittura — ed è una decisione di prodotto, non di codice."
+            );
+            return;
+        }
+
+        // Estrazione VERA, con Oodle assente: se qualcosa qui fallisce, la
+        // classificazione qui sopra è sbagliata e va corretta.
+        let ucas = percorso.with_extension("ucas");
+        if !ucas.exists() {
+            eprintln!("manca il .ucas accanto al .utoc: niente prova");
+            return;
+        }
+
+        // TUTTI i file alla portata, non un campione: la prima versione di
+        // questo test ne prendeva 60 nell'ordine dell'indice, capitava sugli
+        // asset tecnici e concludeva che non c'era testo. I file sono in
+        // chiaro, leggerli tutti costa poco e toglie il dubbio.
+        let niente_oodle: Option<OodleLib> = None;
+        let (mut estratti, mut falliti, mut stringhe) = (0usize, 0usize, 0usize);
+        let mut esempi: Vec<String> = Vec::new();
+        let mut classifica_file: Vec<(usize, String)> = Vec::new();
+
+        for f in uasset_leggibili.iter().take(6000) {
+            match extract_file_from_ucas(
+                &ucas, f.toc_entry_index as usize, &offsets, &blocchi,
+                &metodi, header.compression_block_size, &niente_oodle,
+            ) {
+                Ok(contenuto) => {
+                    estratti += 1;
+                    let trovate = scan_uasset_strings(&contenuto, &f.path);
+                    stringhe += trovate.len();
+                    if !trovate.is_empty() {
+                        classifica_file.push((
+                            trovate.len(),
+                            f.path.rsplit('/').next().unwrap_or("").to_string(),
+                        ));
+                    }
+                    // Esempi dai file PIU' RICCHI, non dai primi che capitano:
+                    // se c'e' testo di gioco, e' li' che si trova.
+                    if trovate.len() >= 5 {
+                        for t in trovate.iter().take(2) {
+                            if esempi.len() < 15 {
+                                esempi.push(format!(
+                                    "{} [{}]: {}",
+                                    f.path.rsplit('/').next().unwrap_or(""),
+                                    trovate.len(),
+                                    t.value.chars().take(70).collect::<String>()
+                                ));
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    falliti += 1;
+                    if falliti <= 3 { eprintln!("  fallito {}: {}", f.path, e); }
+                }
+            }
+        }
+
+        eprintln!("estratti: {estratti} · falliti: {falliti} · stringhe traducibili: {stringhe}");
+
+        classifica_file.sort_by(|a, b| b.0.cmp(&a.0));
+        eprintln!("\nfile con piu' testo:");
+        for (n, nome) in classifica_file.iter().take(12) {
+            eprintln!("  {:>5}  {}", n, nome);
+        }
+        eprintln!("\nesempi dai file piu' ricchi:");
+        for e in &esempi { eprintln!("  · {e}"); }
+
+        assert_eq!(falliti, 0,
+            "un file classificato come non compresso non si è estratto: la \
+             regola che decide cosa è alla nostra portata è sbagliata");
+    }
+}

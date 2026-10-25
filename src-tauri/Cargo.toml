@@ -1,0 +1,139 @@
+[package]
+name = "gamestringer"
+version = "1.17.0"
+description = "GameStringer - AI Game Translation System"
+authors = ["GameStringer Team"]
+license = ""
+repository = ""
+edition = "2021"
+default-run = "gamestringer"
+
+[[bin]]
+name = "gamestringer"
+path = "src/main.rs"
+
+[lib]
+name = "gamestringer"
+path = "src/lib.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "macos-private-api"] }
+tauri-plugin-fs = "2"
+tauri-plugin-shell = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-process = "2"
+tauri-plugin-updater = "2"
+tauri-plugin-notification = "2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+steamlocate = "2.0"
+tokio = { version = "1", features = ["full"] }
+chrono = { version = "0.4", features = ["serde"] }
+# 18/08/2026: alzata da 0.11 a 0.13, la stessa che usano già tauri 2.10 e
+# tauri-plugin-updater. Motivo: la nostra 0.11 era l'UNICA ragione per cui
+# l'albero conteneva hyper 0.14 -> h2 0.3.27, colpito da RUSTSEC-2026-0258
+# (pubblicato il 17/08, DoS da empty DATA frames) che ha fermato il gate
+# cargo audit. Allineandola, la catena vecchia sparisce del tutto invece di
+# essere silenziata con un --ignore. Nel codice si usano solo API di base
+# (Client::builder/new, redirect::Policy, header, Method): nessun certificato
+# custom, proxy o blocking, quindi il salto è a basso rischio.
+# NB sulle feature: in 0.13 `form` (e `query`) sono diventate OPZIONALI, mentre
+# in 0.11 erano sempre disponibili. Il primo cargo check è morto proprio lì:
+# 5 errori E0599 "no method named `form`" su DeepL, che manda i parametri
+# x-www-form-urlencoded. Non è un cambio di API, è un cambio di packaging.
+# `query` non serve: nel codice non compare (misurato, 0 occorrenze).
+reqwest = { version = "0.13", features = ["json", "stream", "form"] }
+moka = { version = "0.12", features = ["future"] }
+rand = "0.10"
+once_cell = "1.19"
+regex = "1.10"
+walkdir = "2.4"
+open = "5.0"
+uuid = { version = "1.0", features = ["v4", "serde"] }
+thiserror = "1.0"
+argon2 = "0.5"
+aes-gcm = "0.10"
+# Cifrario a blocchi nudo: serve per l'ECB dei .pak Unreal (vedi unreal_iostore).
+# Stessa versione gia' presente nel lockfile via aes-gcm: nessun costo aggiuntivo.
+aes = "0.8"
+pbkdf2 = { version = "0.12", features = ["simple"] }
+sha2 = "0.10"
+sha1 = "0.10"
+hmac = "0.12"
+log = "0.4"
+urlencoding = "2.1"
+base64 = "0.22"
+rusqlite = { version = "0.29", features = ["bundled", "chrono"] }
+flate2 = "1.0"
+crc32fast = "1.3"
+md5 = "0.7"
+anyhow = "1.0"
+bincode = "1.3"
+keyvalues-serde = "0.2.2"
+dirs = "6.0.0"
+new-vdf-parser = "0.2.0"
+zip = "4.6"
+# sevenz-rust2, non sevenz-rust: il crate originale è abbandonato (repository
+# cancellato) e RUSTSEC-2026-0245 lo dà vulnerabile in TUTTE le versioni —
+# `decompress_impl` faceva `dest.join(entry.name())` senza validare il nome,
+# quindi un archivio malevolo poteva scrivere fuori dalla cartella con `../..`
+# o con un percorso assoluto. `patched = []`: nessun fix sarebbe mai arrivato.
+# sevenz-rust2 è il successore mantenuto e la correzione è stata VERIFICATA nel
+# sorgente (`util/decompress.rs`, `safe_join`): rifiuta `..`, root e prefissi di
+# drive, e tratta `\` come separatore così un archivio scritto su Windows viene
+# validato anche su Unix. Stessa firma `decompress_file(src, dest)`.
+sevenz-rust2 = "0.21"
+interprocess = "2.2.3"
+parking_lot = "0.12.5"
+tracing = "0.1.43"
+futures = "0.3"
+lz4_flex = "0.11"
+byteorder = "1.5"
+encoding_rs = "0.8"
+image = "0.24"
+libloading = "0.8"
+# Texture GameMaker (chunk TXTR): QOI compresso con BZip2 — vedi ADR-005.
+# Era gia' nel Cargo.lock a 0.4.4 come transitiva, quindi dichiararla diretta
+# non aggiunge nulla da compilare.
+bzip2 = "0.4"
+# Rasterizzazione dei glifi da TTF/OTF per ADR-005. Rust puro, niente
+# dipendenze native: serve solo a trasformare una lettera in pixel.
+fontdue = "0.9"
+
+# === Windows-only dependencies ===
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
+winapi = { version = "0.3", features = ["winuser", "processthreadsapi", "handleapi", "memoryapi", "tlhelp32", "psapi", "synchapi", "winnt"] }
+windows = { version = "0.61", features = [
+    "Win32_Foundation", 
+    "Win32_System_Diagnostics_Debug", 
+    "Win32_System_Memory", 
+    "Win32_System_Threading", 
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_WinRT",
+    "Media_Ocr",
+    "Graphics_Imaging",
+    "Storage_Streams",
+    "Foundation",
+    "Foundation_Collections",
+    "Globalization"
+] }
+# Le `impl IntoFuture` per IAsyncOperation vivono in windows-future dietro la
+# feature `std`, ma `windows` la tira con default-features = false e il suo
+# `std` inoltra solo a windows-core. Senza questa riga `.await` sulle API WinRT
+# non compila ("IAsyncOperation is not a future"). Dipendenza diretta solo per
+# accendere la feature: il codice continua a usarla via `windows::Foundation`.
+windows-future = { version = "0.2", features = ["std"] }
+shared_memory = "0.12.4"
+
+[dev-dependencies]
+tempfile = "3.8"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+

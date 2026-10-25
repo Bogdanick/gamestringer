@@ -1,0 +1,89 @@
+# Aggiornamenti automatici delle dipendenze, raggruppati e settimanali.
+# Obiettivo: aprire POCHE PR già pronte (minor+patch insieme) invece di
+# rincorrere ogni advisory a mano. Gli aggiornamenti di SICUREZZA veri e propri
+# arrivano comunque a parte, ma richiedono "Dependabot alerts" attivo in
+# Settings > Code security. I major restano separati per non mescolare rotture
+# (es. un bump major di Next) con i patch innocui.
+version: 2
+updates:
+  # ── npm (frontend Next/React) ──────────────────────────────────────────────
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Europe/Rome"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+      prefix-development: "chore(deps-dev)"
+    groups:
+      npm-minor-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+    ignore:
+      # Next major va valutato a mano (config/build possono rompersi).
+      - dependency-name: "next"
+        update-types: ["version-update:semver-major"]
+      # Viaggiano CON il major di Next: eslint-config-next 16 pretende
+      # eslint ≥ 9 (PR Dependabot rossa del 03/08/2026, ERESOLVE) e la
+      # migrazione eslint 10 è debito tracciato dal 27/07 (plugin non pronti).
+      # Si sbloccano tutti e tre insieme, deliberatamente — non a pezzi.
+      - dependency-name: "eslint-config-next"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "eslint"
+        update-types: ["version-update:semver-major"]
+      # @tauri-apps/cli e @tauri-apps/api devono stare allo STESSO minor del
+      # crate `tauri` in src-tauri/Cargo.lock, altrimenti `tauri build` rifiuta
+      # su tutti gli OS (difetto 6 della ship v1.16.0; il gate che lo misura è
+      # scripts/check-tauri-parity.js, npm run tauri:parity).
+      # Dependabot non sa niente di Cargo.lock: la PR #76 del 17/08/2026 ha
+      # alzato npm a 2.11.4/2.11.1 lasciando il crate a 2.10.3, e la CI si è
+      # fermata giustamente (run #647, frontend-checks exit 1) — nessun difetto,
+      # il gate ha fatto il suo mestiere.
+      # I PATCH dentro il minor corrente restano liberi apposta: un fix di
+      # sicurezza 2.10.x deve poter passare da solo. Minor e major si alzano A
+      # MANO insieme al crate (cd src-tauri && cargo update -p tauri), con
+      # cargo check a freddo prima di qualunque release.
+      - dependency-name: "@tauri-apps/cli"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      - dependency-name: "@tauri-apps/api"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+
+  # ── Cargo (backend Tauri/Rust) ─────────────────────────────────────────────
+  - package-ecosystem: "cargo"
+    directory: "/src-tauri"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Europe/Rome"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      cargo-minor-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+
+  # ── GitHub Actions (chiude anche i warning "Node.js 20 deprecated") ─────────
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Europe/Rome"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(ci)"
+    groups:
+      actions-all:
+        applies-to: version-updates
+        patterns:
+          - "*"

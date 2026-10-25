@@ -1,0 +1,126 @@
+# Audit sicurezza dipendenze + SBOM (task ROADMAP `sec-deps`).
+#
+# Intercetta CVE note su npm e cargo PRIMA del rilascio e produce un SBOM
+# CycloneDX come artefatto. Gating: fallisce solo su vulnerabilità
+# high/critical (il rumore low/moderate non blocca la CI).
+#
+# NB: i workflow in .github/ sono protetti — questo file va rivisto/approvato
+# da Davide prima del merge. È un punto di partenza sensato, non definitivo.
+
+name: security-audit
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '0 6 * * 1' # ogni lunedì mattina: intercetta CVE nuove su deps ferme
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  npm-audit:
+    name: npm audit + SBOM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '20'
+      # Il gate gira PRIMA dell'install: `npm audit` lavora sul lockfile e non ha
+      # bisogno di node_modules, così il verdetto di sicurezza arriva in fretta e
+      # non dipende dalla riuscita dell'install.
+      #
+      # `npm audit` non ha un equivalente di `cargo audit --ignore`: o passa tutto
+      # o fallisce. Il gate lo fa scripts/audit-gate.js, che blocca su
+      # high/critical e tollera solo le eccezioni motivate e datate elencate lì
+      # dentro (stessa regola dei RUSTSEC ignorati nel job cargo qui sotto).
+      - name: npm audit (gate high/critical)
+        run: node scripts/audit-gate.js --level=high
+      # cyclonedx-npm, a differenza dell'audit, gira `npm ls` e SENZA node_modules
+      # muore con "missing: <pkg>, required by gamestringer". Serve l'albero
+      # installato; `--ignore-scripts` evita il postinstall (prisma generate),
+      # inutile per generare l'SBOM.
+      - name: Installa dipendenze (serve solo all'SBOM)
+        if: always()
+        run: npm ci --ignore-scripts
+      # Niente `|| true`: mascherava il fallimento e l'artefatto sbom-npm non
+      # veniva mai prodotto. continue-on-error lascia il job verde (l'SBOM è un
+      # artefatto, non un gate) ma rende il problema visibile in annotazione.
+      - name: Genera SBOM CycloneDX (npm)
+        if: always()
+        continue-on-error: true
+        run: npx --yes @cyclonedx/cyclonedx-npm --output-file sbom-npm.json
+      - name: Carica SBOM npm
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sbom-npm
+          path: sbom-npm.json
+          if-no-files-found: ignore
+
+  cargo-audit:
+    name: cargo audit + SBOM
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: src-tauri
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Installa cargo-audit e cargo-cyclonedx
+        run: cargo install cargo-audit cargo-cyclonedx --locked || cargo install cargo-audit cargo-cyclonedx
+      # cargo-audit esce !=0 su vulnerabilità: è il gating desiderato.
+      # Gli `--ignore` sono eccezioni motivate, non silenziamenti: vanno
+      # rimossi appena esiste una versione corretta raggiungibile.
+      #
+      # RUSTSEC-2026-0194 / 0195 — quick-xml <0.41: ignore RIMOSSO il 20/10/2026.
+      #   Era tollerato finché plist e tauri-winrt-notification restavano su
+      #   quick-xml <0.41. Alla revisione (scaduta il 01/10) bastava un
+      #   `cargo update -p plist -p notify-rust`, senza toccare Tauri: plist
+      #   1.10 usa quick-xml 0.41, e notify-rust 4.18 porta
+      #   tauri-winrt-notification 0.8, che quick-xml non lo usa più.
+      #
+      # RUSTSEC-2026-0245 / 0246 — sevenz-rust: NESSUN ignore, RISOLTO ALLA RADICE
+      #   l'11/08/2026 migrando a `sevenz-rust2`. Vale la pena scrivere perché non
+      #   è stato messo un ignore, visto che era la strada più corta: qui
+      #   `patched = []` e il progetto è abbandonato col repository CANCELLATO —
+      #   un ignore non avrebbe avuto alcuna condizione di uscita, sarebbe
+      #   scaduto mai e diventato permanente. Un'eccezione che non può essere
+      #   chiusa non è un'eccezione, è una rinuncia scritta in un commento.
+      #
+      # RUSTSEC-2026-0367 / 0368 / 0369 — zip <9.0.0: `ZipArchive::extract()` e
+      #   l'estrazione in streaming conservano i bit SUID/SGID, creano symlink
+      #   con target fuori dalla destinazione e applicano permessi Unix
+      #   attraverso quei symlink. Tutte e tre stanno SOLO in `extract()`.
+      #   Il fix esiste solo in 9.x (`patched = [">= 9.0.0"]`, nessun backport
+      #   su 4.x) e non è raggiungibile: `tauri-plugin-updater` richiede
+      #   `zip ^4` anche nell'ultima 2.14.0 (verificato su crates.io il
+      #   20/10/2026), quindi zip 4.x resta nel grafo comunque.
+      #   Perché non è raggiungibile da input di terzi:
+      #   - il nostro codice (src-tauri/src) NON chiama mai `extract()`: legge
+      #     le entry una per una con `mangled_name()` e scrive file normali,
+      #     senza symlink né `set_permissions` (grep del 20/10/2026);
+      #   - l'updater chiama `extract()` solo nel ramo `#[cfg(windows)]` (zip è
+      #     dipendenza target windows-only) e DOPO `verify_signature` minisign
+      #     sul pacchetto scaricato: un archivio ostile richiede la nostra
+      #     chiave di firma. SUID/SGID e i symlink verificati negli advisory
+      #     sono comportamento macOS/Linux.
+      #   Da rimuovere quando tauri-plugin-updater passa a zip >= 9 (allora va
+      #   portata a 9.x anche la nostra dipendenza diretta `zip = "4.6"`).
+      #   Revisione prevista: 2026-11-20, o prima a ogni bump di Tauri.
+      - name: cargo audit
+        run: cargo audit --ignore RUSTSEC-2026-0367 --ignore RUSTSEC-2026-0368 --ignore RUSTSEC-2026-0369
+      - name: Genera SBOM CycloneDX (cargo)
+        if: always()
+        continue-on-error: true # come sopra: visibile, ma non blocca
+        run: cargo cyclonedx --format json
+      - name: Carica SBOM cargo
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sbom-cargo
+          path: src-tauri/**/*.cdx.json
+          if-no-files-found: ignore

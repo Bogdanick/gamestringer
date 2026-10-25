@@ -1,0 +1,176 @@
+# Secrets
+.tauri-updater-key
+.tauri-updater-key.pub
+
+# Dependencies
+/node_modules
+/.pnp
+.pnp.js
+
+# Build artifacts
+/.next/
+/out/
+/dist/
+*.tsbuildinfo
+
+# Tauri build artifacts
+/src-tauri/target/
+/src-tauri/Cargo.lock
+
+# Internal working notes — local only, by decision (11/08/2026).
+# The roadmap carries raw internal notes (mistakes, costs, spend decisions)
+# and the repo is source-available: it is updated every session but NEVER
+# committed. It was tracked until dd57f150; untracked via `git rm --cached`.
+/ROADMAP.html
+
+# External tools & large binaries (download separately)
+/tools/AssetRipper/
+/tools/UABEA/
+/tools/UIToolkitTranslator/
+/tools/assetstools_inject/
+/tools/drat/
+/tools/esoteric_ebb_strings/
+/unity-translator-dll/build/
+*.pdb
+*.rlib
+*.rmeta
+*.obj
+*.lib
+*.exe
+!scripts/*.exe
+
+# Temp/study files (large binaries)
+/public/tmpdastudiare/
+
+# Local environment files
+.env
+.env*.local
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Secrets and sensitive data
+secrets/
+*.key
+*.pem
+*.p12
+*.pfx
+config/secrets.json
+
+# GameStringer data directory (profiles, settings, etc.)
+/gamestringer_data/
+
+# User profiles (runtime data — mai committare dati utente, anche se cifrati)
+/profiles/
+/src-tauri/profiles/
+
+# Research / cloni di repo terzi per reverse engineering (non sono codice nostro)
+/research/
+
+# Documenti privati (bozze email, note di strategia) — mai nel repo pubblico
+/private/
+
+# Log files
+/logs/
+yarn-error.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.log
+
+# Prisma
+**/dev.db
+**/dev.db-journal
+
+# IDE configuration
+.vscode/
+.idea/
+
+# OS-generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+.port
+/temp/
+__s1.txt
+__testout.txt
+__tr.json
+
+# Test artifacts
+*.exe
+*.pdb
+/tests/integration/*.html
+/tests/integration/*.vdf
+
+# Cache
+.cache/
+.cache_old/
+
+# AI tools
+.claude/
+.kiro/
+
+# gs-hook build artifacts (prodotti da build-all.ps1)
+gs-hook/build/
+gs-hook/build-x64/
+gs-hook/build-x86/
+src-tauri/resources/gs-hook/**/*.dll
+src-tauri/resources/gs-hook/**/*.exe
+gs-hook/testapp/build-x64/
+gs-hook/testapp/build-x86/
+gs-hook/testapp/overlay_test_server.ps1
+
+i18n-report.txt
+
+scripts/_*.js
+
+# Agent / skill tooling (non parte dell'app)
+.agents/
+AGENTS.md
+skills-lock.json
+
+# Local credential cache (never track)
+src-tauri/.cache/
+
+# i18n tooling temp dirs
+.gs-i18n-tmp/
+_gs_split/
+
+# File reali di gioco per il collaudo parser (MAI committare — copyright)
+.samples/*
+!.samples/README.md
+.i18n-work/
+
+# Estrazioni da dump di memoria e da .pak: blob grezzi, testo di giochi
+# commerciali, rigenerabili con scripts/ue-locres-from-dump.js. Le fixture che
+# vale la pena conservare vanno in __tests__/fixtures/, tagliate e documentate
+# — non lasciate qui.
+#
+# ⚠️ La regola è un GLOB, non un elenco. Fino al 02/08/2026 c'erano tre righe
+# esplicite (/estratti/, /estratti2/) e la terza cartella — estratti_pak/, nata
+# dopo con un nome nuovo — è finita DENTRO il repo pubblico: 18 file estratti
+# dal .pak di un gioco commerciale, già su origin/main (commit 9c6971e0). Un elenco copre solo
+# i nomi che qualcuno si è ricordato di aggiungere; il glob copre anche quelli
+# di domani. Se serve una cartella di lavoro nuova, chiamala estratti-<qualcosa>.
+/estratti*/
+/stringhe-dump.txt
+# Dump della sonda gm-strg-probe (stringhe di gioco: mai nel repo, stesso
+# motivo di /estratti*/ — vedi il commento sopra)
+/gm-strg-translatable.txt
+.release-state.json
+
+# Asset OCR generati da scripts/prepare-tesseract-assets.js (~47 MB)
+/public/tesseract/
+
+# Preserved local data archive (not the active profiles)
+/gamestringer_data_archive/

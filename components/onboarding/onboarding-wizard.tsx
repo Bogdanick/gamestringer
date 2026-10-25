@@ -1,0 +1,401 @@
+'use client';
+
+import { useState, useEffect, useCallback } from 'react';
+import {
+  Sparkles,
+  Gamepad2,
+  Globe,
+  Brain,
+  ChevronRight,
+  ChevronLeft,
+  Check,
+  Rocket,
+  Library,
+  Wand2
+} from 'lucide-react';
+import { Button } from '@/components/ui/button';
+import { Badge } from '@/components/ui/badge';
+import { Progress } from '@/components/ui/progress';
+import { Switch } from '@/components/ui/switch';
+import { Label } from '@/components/ui/label';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import {
+  Dialog,
+  DialogContent,
+  DialogTitle,
+} from '@/components/ui/dialog';
+import { VisuallyHidden } from 'radix-ui';
+import { cn } from '@/lib/utils';
+import { TARGET_LANGUAGES } from '@/lib/translation/target-languages';
+import { useDefaultTargetLang } from '@/lib/translation/use-default-target-lang';
+import { useTranslation } from '@/lib/i18n';
+import { clientLogger } from '@/lib/client-logger';
+import {
+  ONBOARDING_KEY,
+  ONBOARDING_VERSION,
+  TUTORIAL_KEY,
+  TUTORIAL_VERSION,
+  isOnboardingDone,
+  isTosAccepted,
+  whenReady,
+} from './first-run';
+
+interface OnboardingStep {
+  id: string;
+  title: string;
+  description: string;
+  icon: React.ElementType;
+  color: string;
+  content: React.ReactNode;
+}
+
+export function OnboardingWizard() {
+  const { t } = useTranslation();
+  const [isOpen, setIsOpen] = useState(false);
+  const [currentStep, setCurrentStep] = useState(0);
+  const [preferences, setPreferences] = useState({
+    scanLibraryOnStart: true,
+    enableNotifications: true,
+    preferredLanguage: 'it',
+    enableAI: true,
+    theme: 'dark'
+  });
+
+  // Il selettore parte dalla lingua già scelta, o da quella dell'interfaccia:
+  // prima mostrava sempre l'italiano anche a chi usa l'app in un'altra lingua.
+  const applyDefaultTarget = useCallback((lang: string) => {
+    setPreferences(p => ({ ...p, preferredLanguage: lang }));
+  }, []);
+  const { markTouched } = useDefaultTargetLang(applyDefaultTarget);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    // Accept any version >= ONBOARDING_VERSION (don't re-show after app updates)
+    if (isOnboardingDone()) return;
+    // Non mostrare finché i Terms of Use non sono stati accettati
+    // (delay to avoid flash on startup)
+    return whenReady(isTosAccepted, () => setIsOpen(true), 400);
+  }, []);
+
+  const completeOnboarding = () => {
+    if (typeof window !== 'undefined') {
+      localStorage.setItem(ONBOARDING_KEY, String(ONBOARDING_VERSION));
+      localStorage.setItem(TUTORIAL_KEY, String(TUTORIAL_VERSION)); // Marca anche il tutorial interattivo come completato
+      localStorage.setItem('gamestringer_preferences', JSON.stringify(preferences));
+    }
+    setIsOpen(false);
+  };
+
+  const skipOnboarding = () => {
+    if (typeof window !== 'undefined') {
+      localStorage.setItem(ONBOARDING_KEY, String(ONBOARDING_VERSION));
+      localStorage.setItem(TUTORIAL_KEY, String(TUTORIAL_VERSION)); // Marca anche il tutorial interattivo come completato
+    }
+    setIsOpen(false);
+  };
+
+  // Scrive la lingua di destinazione dove la leggono le schermate di traduzione
+  // (gameStringerSettings.translation.defaultTargetLang, vedi useDefaultTargetLang)
+  const saveTargetLanguage = (lang: string) => {
+    if (typeof window === 'undefined') return;
+    try {
+      const raw = localStorage.getItem('gameStringerSettings');
+      const s = raw ? JSON.parse(raw) : {};
+      s.translation = { ...(s.translation || {}), defaultTargetLang: lang };
+      localStorage.setItem('gameStringerSettings', JSON.stringify(s));
+      import('@/lib/settings-persistence').then(m => m.persistSettingsToDisk()).catch((e: unknown) => {
+        clientLogger.warn('[Onboarding] persist target language failed:', e);
+      });
+    } catch (e: unknown) {
+      clientLogger.warn('[Onboarding] save target language failed:', e);
+    }
+  };
+
+  // Imposta la lingua di destinazione e la persiste subito (così ha effetto)
+  const setTargetLanguage = (lang: string) => {
+    markTouched();
+    setPreferences(p => ({ ...p, preferredLanguage: lang }));
+    saveTargetLanguage(lang);
+  };
+
+  // Completa l'onboarding e naviga verso la destinazione scelta
+  const goTo = (href: string) => {
+    completeOnboarding();
+    if (typeof window !== 'undefined') window.location.href = href;
+  };
+
+  const TARGET_LANGS: { code: string; label: string }[] = TARGET_LANGUAGES.map(l => ({
+    code: l.code,
+    label: `${l.flag} ${l.name}`,
+  }));
+
+  // Onboarding azionabile a 3 passi: lingua → AI/key → gioco.
+  // Riusa solo chiavi i18n esistenti (nessuna nuova chiave nei locale).
+  const steps: OnboardingStep[] = [
+    {
+      id: 'language',
+      title: t('settings.targetLang'),
+      description: t('onboarding.welcome.description'),
+      icon: Globe,
+      color: 'text-blue-500',
+      content: (
+        <div className="space-y-6">
+          <div className="flex items-center gap-4">
+            <div className="w-16 h-16 bg-blue-500/10 rounded-xl flex items-center justify-center">
+              <Globe className="h-8 w-8 text-blue-500" />
+            </div>
+            <div>
+              <h3 className="text-xl font-bold">{t('settings.targetLang')}</h3>
+              <p className="text-muted-foreground">{t('onboarding.welcome.description')}</p>
+            </div>
+          </div>
+          <p className="text-sm text-muted-foreground">{t('onboarding.welcome.content')}</p>
+          <div className="space-y-2">
+            <Label>{t('settings.targetLang')}</Label>
+            <Select value={preferences.preferredLanguage} onValueChange={setTargetLanguage}>
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {TARGET_LANGS.map(l => (
+                  <SelectItem key={l.code} value={l.code}>{l.label}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+        </div>
+      )
+    },
+    {
+      id: 'ai',
+      title: t('onboarding.ai.title'),
+      description: t('onboarding.ai.description'),
+      icon: Brain,
+      color: 'text-purple-500',
+      content: (
+        <div className="space-y-6">
+          <div className="flex items-center gap-4">
+            <div className="w-16 h-16 bg-purple-500/10 rounded-xl flex items-center justify-center">
+              <Brain className="h-8 w-8 text-purple-500" />
+            </div>
+            <div>
+              <h3 className="text-xl font-bold">{t('onboarding.ai.title')}</h3>
+              <p className="text-muted-foreground">{t('onboarding.ai.subtitle')}</p>
+            </div>
+          </div>
+
+          <div className="p-4 bg-gradient-to-r from-purple-500/10 to-pink-500/10 rounded-lg border border-purple-500/20">
+            <h4 className="font-medium mb-2 flex items-center gap-2">
+              <Sparkles className="h-4 w-4 text-purple-500" />
+              {t('onboarding.ai.ollamaRecommended')}
+            </h4>
+            <p className="text-sm text-muted-foreground mb-3">
+              {t('onboarding.ai.ollamaDesc')} <span className="font-mono text-purple-400">ollama.ai</span> {t('onboarding.ai.ollamaCommand')}
+            </p>
+            <code className="block p-2 bg-black/30 rounded text-sm font-mono text-green-400">
+              ollama run llama3.2
+            </code>
+          </div>
+
+          <div className="space-y-3">
+            <p className="text-sm font-medium">{t('onboarding.ai.supportedProviders')}</p>
+            <div className="grid grid-cols-2 gap-2">
+              {['Ollama (Locale)', 'OpenAI / GPT-4', 'Claude', 'Gemini', 'DeepL', 'Lingva'].map(provider => (
+                <Badge key={provider} variant="outline" className="justify-center py-2">
+                  {provider}
+                </Badge>
+              ))}
+            </div>
+          </div>
+
+          <Button variant="outline" className="w-full" onClick={() => goTo('/settings')}>
+            {t('nav.settings')}
+            <ChevronRight className="h-4 w-4 ml-1" />
+          </Button>
+        </div>
+      )
+    },
+    {
+      id: 'library',
+      title: t('onboarding.library.title'),
+      description: t('onboarding.library.description'),
+      icon: Library,
+      color: 'text-teal-500',
+      content: (
+        <div className="space-y-6">
+          <div className="flex items-center gap-4">
+            <div className="w-16 h-16 bg-teal-500/10 rounded-xl flex items-center justify-center">
+              <Gamepad2 className="h-8 w-8 text-teal-500" />
+            </div>
+            <div>
+              <h3 className="text-xl font-bold">{t('onboarding.library.title')}</h3>
+              <p className="text-muted-foreground">{t('onboarding.library.subtitle')}</p>
+            </div>
+          </div>
+
+          <div className="space-y-3">
+            <p className="text-sm">{t('onboarding.library.detectInfo')}</p>
+            <div className="grid grid-cols-2 gap-2">
+              {['Steam', 'Epic Games', 'GOG Galaxy', 'Origin', 'Ubisoft Connect', 'Battle.net', 'itch.io'].map(store => (
+                <div key={store} className="flex items-center gap-2 p-2 bg-muted/50 rounded">
+                  <Check className="h-4 w-4 text-green-500" />
+                  <span className="text-sm">{store}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="flex items-center justify-between p-4 bg-muted/30 rounded-lg">
+            <div>
+              <Label className="font-medium">{t('onboarding.library.scanOnStartup')}</Label>
+              <p className="text-xs text-muted-foreground">{t('onboarding.library.scanOnStartupDesc')}</p>
+            </div>
+            <Switch
+              checked={preferences.scanLibraryOnStart}
+              onCheckedChange={(checked) => setPreferences(p => ({ ...p, scanLibraryOnStart: checked }))}
+            />
+          </div>
+
+          <Button variant="outline" className="w-full" onClick={() => goTo('/library')}>
+            {t('onboarding.ready.exploreLibrary')}
+            <ChevronRight className="h-4 w-4 ml-1" />
+          </Button>
+        </div>
+      )
+    },
+    {
+      id: 'howTranslate',
+      title: t('onboarding.howto.title'),
+      description: t('onboarding.howto.subtitle'),
+      icon: Wand2,
+      color: 'text-emerald-500',
+      content: (
+        <div className="space-y-6">
+          <div className="flex items-center gap-4">
+            <div className="w-16 h-16 bg-emerald-500/10 rounded-xl flex items-center justify-center">
+              <Wand2 className="h-8 w-8 text-emerald-500" />
+            </div>
+            <div>
+              <h3 className="text-xl font-bold">{t('onboarding.howto.title')}</h3>
+              <p className="text-muted-foreground">{t('onboarding.howto.subtitle')}</p>
+            </div>
+          </div>
+
+          <ol className="space-y-3">
+            {[t('onboarding.howto.s1'), t('onboarding.howto.s2'), t('onboarding.howto.s3'), t('onboarding.howto.s4')].map((s, i) => (
+              <li key={i} className="flex items-start gap-3">
+                <span className="flex-shrink-0 w-6 h-6 rounded-full bg-emerald-500/15 text-emerald-400 text-sm font-bold flex items-center justify-center">{i + 1}</span>
+                <span className="text-sm text-muted-foreground pt-0.5">{s}</span>
+              </li>
+            ))}
+          </ol>
+
+          <div className="p-3 bg-muted/30 rounded-lg text-xs text-muted-foreground">
+            {t('onboarding.howto.note')}
+          </div>
+
+          <Button className="w-full" onClick={() => goTo('/library')}>
+            {t('onboarding.howto.cta')}
+            <ChevronRight className="h-4 w-4 ml-1" />
+          </Button>
+        </div>
+      )
+    }
+  ];
+
+  const currentStepData = steps[currentStep];
+  const progress = ((currentStep + 1) / steps.length) * 100;
+
+  const nextStep = () => {
+    // "Avanti" conferma la lingua mostrata anche se l'utente non ha toccato il selettore
+    if (currentStepData.id === 'language') saveTargetLanguage(preferences.preferredLanguage);
+    if (currentStep < steps.length - 1) {
+      setCurrentStep(currentStep + 1);
+    } else {
+      completeOnboarding();
+    }
+  };
+
+  const prevStep = () => {
+    if (currentStep > 0) {
+      setCurrentStep(currentStep - 1);
+    }
+  };
+
+  const handleClose = (open: boolean) => {
+    if (!open) {
+      // Quando il dialog viene chiuso (anche con X), salva lo stato
+      skipOnboarding();
+    }
+  };
+
+  return (
+    <Dialog open={isOpen} onOpenChange={handleClose}>
+      <DialogContent className="max-w-lg p-0 gap-0 overflow-hidden">
+        <VisuallyHidden.Root>
+          <DialogTitle>{t('onboarding.dialogTitle')}</DialogTitle>
+        </VisuallyHidden.Root>
+        {/* Progress */}
+        <div className="px-6 pt-6">
+          <div className="flex items-center gap-2 mb-2">
+            <currentStepData.icon className={cn("h-5 w-5", currentStepData.color)} />
+            <span className="text-sm font-medium">{currentStepData.title}</span>
+          </div>
+          <Progress value={progress} className="h-1" />
+          <p className="text-xs text-muted-foreground mt-1">
+            {t('onboarding.step').replace('{current}', String(currentStep + 1)).replace('{total}', String(steps.length))}
+          </p>
+        </div>
+
+        {/* Content */}
+        <div className="p-6">
+          {currentStepData.content}
+        </div>
+
+        {/* Navigation */}
+        <div className="flex items-center justify-between p-6 pt-0">
+          <Button
+            variant="ghost"
+            onClick={prevStep}
+            disabled={currentStep === 0}
+          >
+            <ChevronLeft className="h-4 w-4 mr-1" />
+            {t('onboarding.back')}
+          </Button>
+
+          <div className="flex gap-1">
+            {steps.map((_, i) => (
+              <div
+                key={i}
+                className={cn(
+                  "w-2 h-2 rounded-full transition-colors",
+                  i === currentStep ? "bg-primary" : "bg-muted"
+                )}
+              />
+            ))}
+          </div>
+
+          <Button onClick={nextStep}>
+            {currentStep === steps.length - 1 ? (
+              <>
+                {t('onboarding.start')}
+                <Rocket className="h-4 w-4 ml-1" />
+              </>
+            ) : (
+              <>
+                {t('onboarding.next')}
+                <ChevronRight className="h-4 w-4 ml-1" />
+              </>
+            )}
+          </Button>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+export default OnboardingWizard;
+
+
+
+

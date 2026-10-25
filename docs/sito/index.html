@@ -1,0 +1,648 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GameStringer — Traduci qualsiasi videogioco con l'AI</title>
+<meta name="description" content="GameStringer è la suite gratuita e source-available per tradurre videogiochi con l'AI: 12 engine con parser dedicato (Unity, Unreal, Godot, RPG Maker, Ren'Py, Bethesda, CRI…), oltre 20 riconosciuti e 23 provider AI. Analizza, estrai, traduci, applica la patch, gioca.">
+<link rel="icon" href="favicon.png">
+<link rel="canonical" href="https://gamestringer.ai/">
+<meta name="theme-color" content="#080a12">
+<!-- Open Graph / Twitter: senza questi ogni link condiviso (Discord, X, Reddit)
+     appare senza anteprima. og-image.svg era già in images/ ma non referenziata. -->
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="GameStringer">
+<meta property="og:url" content="https://gamestringer.ai/">
+<meta property="og:title" content="GameStringer — Traduci qualsiasi videogioco con l'AI">
+<meta property="og:description" content="Suite gratuita e source-available per tradurre videogiochi con l'AI: rileva l'engine, estrae il testo, traduce e riapplica la patch. Backup automatico prima di ogni modifica.">
+<meta property="og:image" content="https://gamestringer.ai/images/og-image.svg">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="GameStringer — Traduci qualsiasi videogioco con l'AI">
+<meta name="twitter:description" content="Suite gratuita e source-available per tradurre videogiochi con l'AI: rileva l'engine, estrae il testo, traduce e riapplica la patch.">
+<meta name="twitter:image" content="https://gamestringer.ai/images/og-image.svg">
+<style>
+  :root{
+    --bg:#080a12; --bg2:#0c1020; --surface:rgba(255,255,255,.04); --surface2:rgba(255,255,255,.06);
+    --border:rgba(255,255,255,.10); --text:#e8ebf2; --muted:#9aa6bd; --faint:#6b7689;
+    --core:#8b5cf6; --core2:#6366f1;
+    --trad:#3b82f6; --trad2:#38bdf8;
+    --patch:#10b981; --patch2:#14b8a6;
+    --res:#f59e0b; --res2:#fb923c;
+    --radius:18px; --maxw:1180px;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth}
+  body{background:var(--bg);color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,Helvetica,Arial,sans-serif;
+    line-height:1.6;-webkit-font-smoothing:antialiased;overflow-x:hidden}
+  .bgfx{position:fixed;inset:0;z-index:-1;pointer-events:none;
+    background:
+      radial-gradient(60rem 40rem at 12% -8%, rgba(139,92,246,.18), transparent 60%),
+      radial-gradient(50rem 38rem at 92% 4%, rgba(56,189,248,.14), transparent 60%),
+      radial-gradient(46rem 40rem at 78% 92%, rgba(16,185,129,.12), transparent 60%),
+      radial-gradient(40rem 36rem at 8% 96%, rgba(245,158,11,.10), transparent 60%),
+      var(--bg)}
+  .container{max-width:var(--maxw);margin:0 auto;padding:0 22px}
+  a{color:inherit;text-decoration:none}
+  h1,h2,h3{line-height:1.15;letter-spacing:-.02em;font-weight:800}
+  nav{position:sticky;top:0;z-index:50;backdrop-filter:blur(14px);background:rgba(8,10,18,.7);border-bottom:1px solid var(--border)}
+  .nav{display:flex;align-items:center;justify-content:space-between;height:66px;gap:14px}
+  .brand{display:flex;align-items:center;gap:10px;font-weight:800;font-size:18px}
+  .brand .dot{width:30px;height:30px;border-radius:9px;object-fit:cover;box-shadow:0 0 22px rgba(139,92,246,.5)}
+  .brand .brandname{background:linear-gradient(90deg,#8b5cf6,#6366f1,#3b82f6,#8b5cf6);background-size:200% 100%;-webkit-background-clip:text;background-clip:text;color:transparent;animation:brandGrad 4s linear infinite}
+  @keyframes brandGrad{0%{background-position:0% 50%}100%{background-position:200% 50%}}
+  /* nowrap: senza questo le voci lunghe ("Under the hood") vanno a capo su più
+     righe e sfondano l'altezza della barra. gap ridotto perché le voci sono 11. */
+  .nav-links{display:flex;align-items:center;gap:16px;font-size:13.5px;color:var(--muted);white-space:nowrap}
+  .nav-links a{white-space:nowrap}
+  .nav-links a:hover{color:#fff}
+  .nav-right{display:flex;align-items:center;gap:12px}
+  .lang{background:var(--bg2);color:var(--text);border:1px solid var(--border);border-radius:10px;padding:8px 10px;font-size:13px;cursor:pointer}
+  .lang option{background:#0c1020;color:#e8ebf2}
+  .btn{display:inline-flex;align-items:center;gap:8px;border-radius:12px;padding:11px 18px;font-weight:700;font-size:14px;border:1px solid var(--border);transition:.2s;cursor:pointer}
+  .btn:hover{transform:translateY(-2px)}
+  .btn-primary{background:linear-gradient(135deg,var(--core),var(--core2));border:none;color:#fff;box-shadow:0 10px 30px rgba(99,102,241,.35)}
+  .btn-ghost{background:var(--surface)}
+  /* 11 voci + selettore lingua + bottone: sotto ~1200px non ci stanno in riga */
+  @media(max-width:1200px){.nav-links{display:none}}
+  .hero{padding:84px 0 64px;text-align:center}
+  .pill{display:inline-flex;align-items:center;gap:8px;font-size:12.5px;font-weight:600;padding:7px 14px;border-radius:999px;border:1px solid var(--border);background:var(--surface);color:var(--muted)}
+  .pill b{color:var(--patch2)}
+  .hero h1{font-size:clamp(2.3rem,5.4vw,4rem);margin:22px 0 0}
+  .grad{background:linear-gradient(110deg,#8b5cf6,#6366f1 45%,#38bdf8 80%);-webkit-background-clip:text;background-clip:text;color:transparent}
+  .hero p.lead{max-width:680px;margin:20px auto 0;color:var(--muted);font-size:1.12rem}
+  .cta{display:flex;gap:14px;justify-content:center;flex-wrap:wrap;margin-top:34px}
+  .stats{display:flex;gap:14px;justify-content:center;flex-wrap:wrap;margin-top:54px}
+  .stat{min-width:120px;padding:18px 22px;border-radius:16px;background:var(--surface);border:1px solid var(--border)}
+  .stat .n{font-size:1.8rem;font-weight:800}
+  .stat .l{font-size:11.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--faint)}
+  section{padding:72px 0}
+  .label{font-size:12px;font-weight:700;letter-spacing:.16em;text-transform:uppercase;color:var(--faint)}
+  .label.core{color:var(--core)} .label.trad{color:var(--trad2)} .label.patch{color:var(--patch2)} .label.res{color:var(--res2)}
+  .h2{font-size:clamp(1.7rem,3.4vw,2.5rem);margin:10px 0 12px}
+  .sub{color:var(--muted);max-width:660px;margin-bottom:8px}
+  .pipe{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-top:42px}
+  @media(max-width:980px){.pipe{grid-template-columns:repeat(2,1fr)}}
+  @media(max-width:560px){.pipe{grid-template-columns:1fr}}
+  .node{position:relative;padding:22px 18px;border-radius:16px;background:var(--surface);border:1px solid var(--border);overflow:hidden;transition:.25s}
+  .node:hover{transform:translateY(-4px);border-color:rgba(255,255,255,.22)}
+  .node .step{position:absolute;top:12px;right:14px;font-size:34px;font-weight:800;color:rgba(255,255,255,.06)}
+  .node .ic{width:46px;height:46px;border-radius:12px;display:flex;align-items:center;justify-content:center;margin-bottom:14px;font-size:22px}
+  .node h3{font-size:1.06rem;margin-bottom:6px}
+  .node p{font-size:13.5px;color:var(--muted)}
+  .node::before{content:"";position:absolute;left:0;top:0;height:100%;width:3px;background:var(--accent,var(--core))}
+  .ic.core{background:rgba(139,92,246,.16);color:#c4b5fd}
+  .ic.trad{background:rgba(56,189,248,.16);color:#7dd3fc}
+  .ic.patch{background:rgba(16,185,129,.16);color:#6ee7b7}
+  .ic.res{background:rgba(245,158,11,.16);color:#fcd34d}
+  .legend{display:flex;gap:18px;flex-wrap:wrap;margin-top:26px;font-size:12.5px;color:var(--muted)}
+  .legend span{display:inline-flex;align-items:center;gap:7px}
+  .swatch{width:11px;height:11px;border-radius:3px;display:inline-block}
+  .arch{margin-top:40px;border:1px solid var(--border);border-radius:var(--radius);background:var(--surface);padding:30px 22px}
+  .arch svg{width:100%;height:auto;display:block}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px;margin-top:36px}
+  .card{padding:22px;border-radius:16px;background:var(--surface);border:1px solid var(--border);transition:.25s}
+  .card:hover{transform:translateY(-4px);border-color:rgba(255,255,255,.2);background:var(--surface2)}
+  .card .tag{font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase}
+  .card h3{font-size:1.08rem;margin:8px 0 6px}
+  .card p{font-size:13.8px;color:var(--muted)}
+  .tcore{color:var(--core)} .ttrad{color:var(--trad2)} .tpatch{color:var(--patch2)} .tres{color:var(--res2)}
+  .engines{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-top:34px}
+  .eng{padding:18px;border-radius:14px;background:var(--surface);border:1px solid var(--border);text-align:center;transition:.2s}
+  .eng:hover{transform:translateY(-3px);border-color:var(--patch2)}
+  .eng h4{font-size:1rem}
+  .eng small{color:var(--faint);font-size:11.5px}
+  .eng .ok{display:inline-block;margin-top:8px;font-size:10.5px;font-weight:700;color:var(--patch2);background:rgba(16,185,129,.12);padding:2px 8px;border-radius:999px}
+  .eng .part{display:inline-block;margin-top:8px;font-size:10.5px;font-weight:700;color:var(--res2);background:rgba(245,158,11,.14);padding:2px 8px;border-radius:999px}
+  .tablewrap{margin-top:30px;border:1px solid var(--border);border-radius:var(--radius);overflow:hidden}
+  table{width:100%;border-collapse:collapse;font-size:14px}
+  th,td{padding:14px 16px;text-align:left;border-bottom:1px solid var(--border)}
+  th{background:rgba(255,255,255,.03);font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--faint)}
+  tr:last-child td{border-bottom:none}
+  .badge{font-size:11px;font-weight:700;padding:3px 9px;border-radius:999px}
+  .b-local{background:rgba(16,185,129,.14);color:var(--patch2)}
+  .b-cloud{background:rgba(56,189,248,.14);color:var(--trad2)}
+  .news{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px;margin-top:34px}
+  .newcard{padding:22px;border-radius:16px;border:1px solid var(--border);background:linear-gradient(180deg,rgba(99,102,241,.08),rgba(255,255,255,.02))}
+  .newcard h3{font-size:1.05rem;margin-bottom:6px}
+  .newcard p{font-size:13.6px;color:var(--muted)}
+  details{border:1px solid var(--border);border-radius:14px;background:var(--surface);margin-top:12px;padding:2px 18px}
+  summary{cursor:pointer;padding:16px 0;font-weight:700;list-style:none;display:flex;justify-content:space-between;align-items:center;gap:14px}
+  summary::-webkit-details-marker{display:none}
+  summary::after{content:"+";color:var(--trad2);font-size:22px;font-weight:800}
+  details[open] summary::after{content:"–"}
+  details p{padding:0 0 16px;color:var(--muted);font-size:14px}
+  footer{border-top:1px solid var(--border);padding:50px 0 40px;text-align:center;color:var(--muted)}
+  .flinks{display:flex;gap:22px;justify-content:center;flex-wrap:wrap;margin:18px 0;font-size:14px}
+  .flinks a:hover{color:var(--trad2)}
+  .copy{font-size:12px;color:var(--faint);margin-top:18px}
+  .reveal{opacity:0;transform:translateY(24px);transition:.6s cubic-bezier(.2,.7,.2,1)}
+  .reveal.in{opacity:1;transform:none}
+  @media(prefers-reduced-motion:reduce){.reveal{opacity:1;transform:none;transition:none}}
+  .flow{stroke-dasharray:6 8;animation:dash 1.4s linear infinite}
+  @keyframes dash{to{stroke-dashoffset:-28}}
+  @media(prefers-reduced-motion:reduce){.flow{animation:none}}
+</style>
+</head>
+<body>
+<div class="bgfx"></div>
+
+<nav>
+  <div class="container nav">
+    <a class="brand" href="#top"><img class="dot" src="logo.png" alt="GameStringer"> <span class="brandname">GameStringer</span></a>
+    <div class="nav-links">
+      <a href="#come-funziona" data-i18n="nav.how">Come funziona</a>
+      <a href="#novita" data-i18n="nav.new" style="color:var(--trad2)">Novità</a>
+      <a href="#architettura" data-i18n="nav.engine">Pipeline</a>
+      <a href="#sotto-il-cofano" data-i18n="nav.tech">Sotto il cofano</a>
+      <a href="#funzioni" data-i18n="nav.functions">Funzioni</a>
+      <a href="#engine" data-i18n="nav.engines2">Motori</a>
+      <a href="#ai" data-i18n="nav.ai">AI</a>
+      <a href="#faq" data-i18n="nav.faq">FAQ</a>
+      <a href="compatibilita.html" data-i18n="nav.compat" style="color:var(--patch2)">Compatibilità</a>
+      <a href="benchmark.html" style="color:#fbbf24">🏆 Benchmark</a>
+      <a href="guida.html" data-i18n="nav.guide" style="color:var(--core)">Guida</a>
+    </div>
+    <div class="nav-right">
+      <select class="lang" id="langSel" aria-label="Language">
+        <option value="it">Italiano</option>
+        <option value="en">English</option>
+        <option value="es">Español</option>
+        <option value="fr">Français</option>
+        <option value="de">Deutsch</option>
+        <option value="pt">Português</option>
+        <option value="pl">Polski</option>
+        <option value="ru">Русский</option>
+        <option value="ja">日本語</option>
+        <option value="zh">中文</option>
+        <option value="ko">한국어</option>
+        <option value="el">Ελληνικά</option>
+      </select>
+      <a class="btn btn-primary" href="https://github.com/rouges78/GameStringer/releases/latest" target="_blank" rel="noopener" data-i18n="nav.download">Scarica</a>
+    </div>
+  </div>
+</nav>
+
+<header class="hero" id="top">
+  <div class="container">
+    <span class="pill reveal">🎮 Source-available · <b>v1.17.0</b> · Windows · Linux · macOS</span>
+    <h1 class="reveal" data-i18n-html="hero.title">Traduci qualsiasi videogioco<br><span class="grad">con l'intelligenza artificiale</span></h1>
+    <p class="lead reveal" data-i18n="hero.lead">GameStringer analizza il gioco, riconosce l'engine, estrae il testo, lo traduce con l'AI e riapplica la patch — in automatico. Niente riga di comando, niente modding manuale. Backup sempre prima di toccare i file.</p>
+    <div class="cta reveal">
+      <a class="btn btn-primary" href="https://github.com/rouges78/GameStringer/releases/latest" target="_blank" rel="noopener" data-i18n="hero.cta1">⬇ Scarica l'ultima versione</a>
+      <a class="btn btn-ghost" href="#come-funziona" data-i18n="hero.cta2">Scopri come funziona</a>
+      <a class="btn btn-ghost" href="guida.html">📖 <span data-i18n="nav.guide">Guida</span></a>
+    </div>
+    <!-- margin-inline:auto: .sub ha max-width 660px senza margini auto, quindi
+         nell'hero centrato il blocco restava ancorato a sinistra. -->
+    <p class="sub reveal" data-i18n-html="hero.avnote" style="font-size:13px;margin:14px auto 0;max-width:720px;opacity:.85;text-wrap:balance">🛡️ Windows può mostrare un avviso SmartScreen al primo avvio: è un <b>falso positivo</b> noto. <a href="https://github.com/rouges78/GameStringer/blob/main/docs/ANTIVIRUS.md" target="_blank" rel="noopener">Perché è sicuro e come procedere →</a></p>
+    <div class="stats">
+      <div class="stat reveal"><div class="n grad">20+</div><div class="l" data-i18n="stat.engines">Engine riconosciuti</div></div>
+      <div class="stat reveal"><div class="n grad">23</div><div class="l" data-i18n="stat.ai">Provider AI</div></div>
+      <div class="stat reveal"><div class="n grad">12</div><div class="l" data-i18n="stat.langs">Lingue UI</div></div>
+      <div class="stat reveal"><div class="n grad">10</div><div class="l" data-i18n="stat.games">Store collegati</div></div>
+    </div>
+  </div>
+</header>
+
+<section id="come-funziona">
+  <div class="container">
+    <span class="label core reveal" data-i18n="pipe.label">// La pipeline del motore</span>
+    <h2 class="h2 reveal" data-i18n="pipe.h2">Dal gioco originale alla tua lingua, in 7 passi</h2>
+    <p class="sub reveal" data-i18n="pipe.sub">Ogni traduzione segue lo stesso flusso automatico. I colori indicano l'area del motore coinvolta.</p>
+    <div class="pipe">
+      <div class="node reveal" style="--accent:var(--res)"><span class="step">1</span><div class="ic res">📂</div><h3 data-i18n="s1.t">Scansione</h3><p data-i18n="s1.d">Rileva la libreria (Steam, Epic, GOG…) e scansiona la cartella del gioco alla ricerca dei file di testo.</p></div>
+      <div class="node reveal" style="--accent:var(--core)"><span class="step">2</span><div class="ic core">🧠</div><h3 data-i18n="s2.t">P.T. — Analisi</h3><p data-i18n="s2.d">Il Prediction Tool stima difficoltà 0–100, volume stringhe, DRM/anti-cheat, encoding e tempi su più modelli.</p></div>
+      <div class="node reveal" style="--accent:var(--patch)"><span class="step">3</span><div class="ic patch">🔍</div><h3 data-i18n="s3.t">Rileva engine</h3><p data-i18n="s3.d">Identifica l'engine (Unity, Unreal, Godot, RPG Maker, Ren'Py, Bethesda, CRI…) e sceglie la strategia giusta.</p></div>
+      <div class="node reveal" style="--accent:var(--patch)"><span class="step">4</span><div class="ic patch">📝</div><h3 data-i18n="s4.t">Estrazione</h3><p data-i18n="s4.d">Estrae le stringhe dai formati nativi: JSON, .locres, .rpy, CPK, BSA/BA2, StringTable Unity e altri.</p></div>
+      <div class="node reveal" style="--accent:var(--trad)"><span class="step">5</span><div class="ic trad">✨</div><h3 data-i18n="s5.t">Traduzione AI</h3><p data-i18n="s5.d">20+ provider, con Translation Memory, glossario automatico e punteggio di qualità 0–100 su ogni riga.</p></div>
+      <div class="node reveal" style="--accent:var(--patch)"><span class="step">6</span><div class="ic patch">🩹</div><h3 data-i18n="s6.t">Patch / Injection</h3><p data-i18n="s6.d">Riscrive il testo tradotto nel gioco (file o runtime). Backup automatico prima di ogni modifica.</p></div>
+      <div class="node reveal" style="--accent:var(--patch)"><span class="step">7</span><div class="ic patch">🎮</div><h3 data-i18n="s7.t">Gioca</h3><p data-i18n="s7.d">Avvii il gioco nella tua lingua. Se Steam aggiorna il gioco, GameStringer ti avvisa per ri-applicare la patch.</p></div>
+      <div class="node reveal" style="--accent:var(--core)"><span class="step">+</span><div class="ic core">🔁</div><h3 data-i18n="s8.t">Memoria & QA</h3><p data-i18n="s8.d">Correzioni e termini restano nella Translation Memory: coerenza nel tempo, mai tradurre due volte la stessa frase.</p></div>
+    </div>
+    <div class="legend reveal">
+      <span><i class="swatch" style="background:var(--core)"></i> <span data-i18n="leg.core">Core / P.T.</span></span>
+      <span><i class="swatch" style="background:var(--trad2)"></i> <span data-i18n="leg.trad">Traduzione AI</span></span>
+      <span><i class="swatch" style="background:var(--patch2)"></i> <span data-i18n="leg.patch">Engine / Patcher</span></span>
+      <span><i class="swatch" style="background:var(--res2)"></i> <span data-i18n="leg.res">Risorse / Libreria</span></span>
+    </div>
+  </div>
+</section>
+
+<section id="v112">
+  <div class="container">
+    <span class="label trad reveal" data-i18n="v112.label">// Traduzione più intelligente</span>
+    <h2 class="h2 reveal" data-i18n="v112.h2">Traduzioni più intelligenti, che si correggono da sole</h2>
+    <p class="sub reveal" data-i18n="v112.sub">Contesto visivo, una revisione automatica della traduzione e una memoria che ragiona per significato. Tutto opzionale, e possibile anche in locale con Ollama.</p>
+    <div class="arch reveal">
+      <svg viewBox="0 0 1000 270" role="img" aria-label="Contesto visivo, auto-correzione, memoria semantica">
+        <defs>
+          <linearGradient id="gV1" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#38bdf8"/><stop offset="1" stop-color="#3b82f6"/></linearGradient>
+        </defs>
+        <rect x="24" y="26" width="300" height="212" rx="16" fill="rgba(56,189,248,.08)" stroke="#38bdf8"/>
+        <circle cx="174" cy="72" r="24" fill="rgba(56,189,248,.16)"/>
+        <text x="174" y="80" text-anchor="middle" font-size="24">👁️</text>
+        <text x="174" y="122" text-anchor="middle" fill="#7dd3fc" font-size="16" font-weight="700" data-i18n="v112.p1">Contesto visivo (VLM)</text>
+        <text x="174" y="150" text-anchor="middle" fill="#cbd5e1" font-size="12" data-i18n="v112.p1a">L'AI vede lo schermo e traduce</text>
+        <text x="174" y="168" text-anchor="middle" fill="#cbd5e1" font-size="12" data-i18n="v112.p1b">sciogliendo le ambiguità</text>
+        <text x="174" y="202" text-anchor="middle" fill="#9aa6bd" font-size="11.5" font-style="italic" data-i18n="v112.p1c">"Chest" = forziere o petto?</text>
+        <rect x="350" y="26" width="300" height="212" rx="16" fill="rgba(139,92,246,.08)" stroke="#8b5cf6"/>
+        <circle cx="500" cy="72" r="24" fill="rgba(139,92,246,.16)"/>
+        <text x="500" y="80" text-anchor="middle" font-size="24">🪞</text>
+        <text x="500" y="122" text-anchor="middle" fill="#c4b5fd" font-size="16" font-weight="700" data-i18n="v112.p2">Auto-correzione</text>
+        <text x="500" y="150" text-anchor="middle" fill="#cbd5e1" font-size="12" data-i18n="v112.p2a">Rilegge e rifinisce la traduzione</text>
+        <text x="500" y="168" text-anchor="middle" fill="#cbd5e1" font-size="12" data-i18n="v112.p2b">su glossario, tono e coerenza</text>
+        <text x="500" y="202" text-anchor="middle" fill="#9aa6bd" font-size="11.5" font-style="italic" data-i18n="v112.p2c">scrivi → rifletti → rifinisci</text>
+        <rect x="676" y="26" width="300" height="212" rx="16" fill="rgba(16,185,129,.08)" stroke="#10b981"/>
+        <circle cx="826" cy="72" r="24" fill="rgba(16,185,129,.16)"/>
+        <text x="826" y="80" text-anchor="middle" font-size="24">🧠</text>
+        <text x="826" y="122" text-anchor="middle" fill="#6ee7b7" font-size="16" font-weight="700" data-i18n="v112.p3">Memoria semantica (RAG)</text>
+        <text x="826" y="150" text-anchor="middle" fill="#cbd5e1" font-size="12" data-i18n="v112.p3a">Riusa le frasi già tradotte</text>
+        <text x="826" y="168" text-anchor="middle" fill="#cbd5e1" font-size="12" data-i18n="v112.p3b">per significato, non parola per parola</text>
+        <text x="826" y="202" text-anchor="middle" fill="#9aa6bd" font-size="11.5" font-style="italic" data-i18n="v112.p3c">terminologia coerente nel gioco</text>
+      </svg>
+    </div>
+    <div class="grid">
+      <div class="card reveal"><div class="tag ttrad" data-i18n="tag.trad">Traduzione</div><h3 data-i18n="v112.c1t">👁️ Contesto visivo (VLM)</h3><p data-i18n="v112.c1d">Traduzione con contesto visivo (VLM): l'AI vede lo schermo e traduce col contesto, risolvendo le parole ambigue (es. "Chest" = forziere o petto). Locale (Ollama) o OpenAI/Gemini</p></div>
+      <div class="card reveal"><div class="tag ttrad" data-i18n="tag.trad">Traduzione</div><h3 data-i18n="v112.c2t">🪞 Traduzioni auto-correttive</h3><p data-i18n="v112.c2d">Passaggio auto-correttivo (Reflection): una seconda passata opzionale rivede e rifinisce la traduzione su glossario, tono e coerenza — solo dove serve</p></div>
+      <div class="card reveal"><div class="tag ttrad" data-i18n="tag.trad">Traduzione</div><h3 data-i18n="v112.c3t">🧠 Memoria semantica (RAG)</h3><p data-i18n="v112.c3d">Memoria semantica (RAG): Translation Memory e glossario abbinati per significato tramite embedding locali, per una terminologia coerente in tutto il gioco</p></div>
+      <div class="card reveal"><div class="tag tpatch" data-i18n="tag.patch">Engine</div><h3 data-i18n="v112.c4t">⚡ Live più fluida</h3><p data-i18n="v112.c4d">Traduzione live più fluida ed elaborazione nativa degli screenshot (ritaglio/ridimensionamento prima della chiamata AI)</p></div>
+      <div class="card reveal"><div class="tag ttrad" data-i18n="tag.trad">Traduzione</div><h3 data-i18n="v112.c5t">🔌 Più provider pronti all'uso</h3><p data-i18n="v112.c5d">Più provider pronti all'uso: DeepL, Groq, Cerebras, Cohere, Together, Fireworks, Hugging Face, Azure Translator, DashScope, LibreTranslate, Lingva, MyMemory</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="architettura" style="background:rgba(255,255,255,.015)">
+  <div class="container">
+    <span class="label patch reveal" data-i18n="arch.label">// Architettura del motore</span>
+    <h2 class="h2 reveal" data-i18n="arch.h2">Una rilevazione, tre strade di traduzione</h2>
+    <p class="sub reveal" data-i18n="arch.sub">In base all'engine, GameStringer sceglie automaticamente il percorso migliore: patch sui file, injection a runtime, oppure OCR a schermo.</p>
+    <div class="arch reveal">
+      <svg viewBox="0 0 1000 430" role="img" aria-label="Engine detection branching into three translation paths">
+        <defs>
+          <linearGradient id="gCore" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#8b5cf6"/><stop offset="1" stop-color="#6366f1"/></linearGradient>
+        </defs>
+        <rect x="400" y="22" width="200" height="64" rx="14" fill="url(#gCore)"/>
+        <text x="500" y="49" text-anchor="middle" fill="#fff" font-size="17" font-weight="700" data-i18n="arch.detect">Rilevamento engine</text>
+        <text x="500" y="70" text-anchor="middle" fill="rgba(255,255,255,.85)" font-size="12">Universal Injector · auto-detect</text>
+        <path class="flow" d="M460,86 C300,120 200,130 175,168" fill="none" stroke="#10b981" stroke-width="2.5"/>
+        <path class="flow" d="M500,86 L500,168" fill="none" stroke="#f59e0b" stroke-width="2.5"/>
+        <path class="flow" d="M540,86 C700,120 800,130 825,168" fill="none" stroke="#3b82f6" stroke-width="2.5"/>
+        <rect x="40" y="168" width="270" height="54" rx="12" fill="rgba(16,185,129,.14)" stroke="#10b981"/>
+        <text x="175" y="192" text-anchor="middle" fill="#6ee7b7" font-size="15" font-weight="700" data-i18n="arch.p1">Patcher su file</text>
+        <text x="175" y="211" text-anchor="middle" fill="#9aa6bd" font-size="11.5" data-i18n="arch.p1d">parsing &amp; patch dei file del gioco</text>
+        <rect x="365" y="168" width="270" height="54" rx="12" fill="rgba(245,158,11,.14)" stroke="#f59e0b"/>
+        <text x="500" y="192" text-anchor="middle" fill="#fcd34d" font-size="15" font-weight="700" data-i18n="arch.p2">Injection a runtime</text>
+        <text x="500" y="211" text-anchor="middle" fill="#9aa6bd" font-size="11.5" data-i18n="arch.p2d">BepInEx · hook DLL (Windows)</text>
+        <rect x="690" y="168" width="270" height="54" rx="12" fill="rgba(56,189,248,.14)" stroke="#3b82f6"/>
+        <text x="825" y="192" text-anchor="middle" fill="#7dd3fc" font-size="15" font-weight="700" data-i18n="arch.p3">OCR a schermo</text>
+        <text x="825" y="211" text-anchor="middle" fill="#9aa6bd" font-size="11.5" data-i18n="arch.p3d">retro / RPG_RT classico</text>
+        <g font-size="12.5" fill="#cbd5e1">
+          <rect x="40" y="246" width="270" height="150" rx="12" fill="rgba(255,255,255,.03)" stroke="rgba(255,255,255,.08)"/>
+          <text x="60" y="272">• Unity (assets, StringTable)</text>
+          <text x="60" y="296">• Unreal (.locres, _P.pak)</text>
+          <text x="60" y="320">• Ren'Py · RPG Maker MV/MZ</text>
+          <text x="60" y="344">• Godot · GameMaker · Wolf RPG</text>
+          <text x="60" y="368">• Bethesda (BSA/BA2/ESP) · CRI (CPK)</text>
+          <rect x="365" y="246" width="270" height="150" rx="12" fill="rgba(255,255,255,.03)" stroke="rgba(255,255,255,.08)"/>
+          <text x="385" y="272" data-i18n="arch.r2a">• Unity senza file estraibili →</text>
+          <text x="385" y="296">  BepInEx + XUnity.AutoTranslator</text>
+          <text x="385" y="320" data-i18n="arch.r2c">• Hook DLL / memory injection</text>
+          <text x="385" y="344" data-i18n="arch.r2d">• Gate anti-cheat: blocca i</text>
+          <text x="385" y="368" data-i18n="arch.r2e">  giochi online (EAC/BattlEye…)</text>
+          <rect x="690" y="246" width="270" height="150" rx="12" fill="rgba(255,255,255,.03)" stroke="rgba(255,255,255,.08)"/>
+          <text x="710" y="272" data-i18n="arch.r3a">• Giochi retro (8/16-bit, DOS)</text>
+          <text x="710" y="296" data-i18n="arch.r3b">• RPG Maker 2000/2003 classico</text>
+          <text x="710" y="320" data-i18n="arch.r3c">• Cattura schermo + Tesseract</text>
+          <text x="710" y="344" data-i18n="arch.r3d">• Overlay traduzione in tempo</text>
+          <text x="710" y="368" data-i18n="arch.r3e">  reale mentre giochi</text>
+        </g>
+      </svg>
+    </div>
+    <p class="sub reveal" style="margin-top:18px;font-size:13px;color:var(--faint)" data-i18n="arch.note">Nota: l'injection a runtime usa DLL injection e può far scattare gli anti-cheat. Usala solo su giochi single-player/offline — il P.T. rileva DRM e anti-cheat prima di qualsiasi modifica.</p>
+  </div>
+</section>
+
+<section id="sotto-il-cofano">
+  <div class="container">
+    <span class="label patch reveal" data-i18n="uh.label">// Sotto il cofano</span>
+    <h2 class="h2 reveal" data-i18n="uh.h2">Sotto il cofano: come lavora davvero il motore</h2>
+    <p class="sub reveal" data-i18n="uh.sub">Un giro tecnico nei sottosistemi che trasformano un gioco in un'altra lingua — senza riga di comando, senza modding manuale.</p>
+    <div class="grid">
+      <div class="card reveal"><div class="tag tpatch" data-i18n="tag.patch">Engine</div><h3 data-i18n="uh.c1t">Rilevamento engine</h3><p data-i18n="uh.c1d">GameStringer impronta il gioco dai marcatori su disco (eseguibili, cartelle, file firma come .pak, .assets, .rpa) e lo instrada all'engine giusto con un dispatcher auto-detect (Universal Injector). Nessuna configurazione manuale.</p></div>
+      <div class="card reveal"><div class="tag tpatch" data-i18n="tag.patch">Engine</div><h3 data-i18n="uh.c2t">Estrazione per formato</h3><p data-i18n="uh.c2d">Parser dedicati leggono i formati nativi: StringTable e assets Unity, .locres e _P.pak Unreal, .rpy Ren'Py, data/*.json RPG Maker MV/MZ, CPK/CRILAYLA CRI, BSA/BA2 Bethesda. Ogni stringa conserva il percorso originale per la riscrittura.</p></div>
+      <div class="card reveal"><div class="tag ttrad" data-i18n="tag.trad">Traduzione</div><h3 data-i18n="uh.c3t">Orchestrazione AI</h3><p data-i18n="uh.c3d">Una catena di provider con fallback automatico (es. Gemini → DeepSeek → OpenAI), contesto per-stringa, glossario e Translation Memory iniettati nel prompt, e codici di controllo del gioco preservati. Con i modelli locali (Ollama) è una chiamata per stringa.</p></div>
+      <div class="card reveal"><div class="tag ttrad" data-i18n="tag.trad">Traduzione</div><h3 data-i18n="uh.c4t">Qualità & memoria</h3><p data-i18n="uh.c4d">Ogni riga riceve un punteggio 0–100 con heatmap visiva; correzioni e termini finiscono nella Translation Memory locale, così la stessa frase non si traduce mai due volte e lo stile resta coerente nel tempo.</p></div>
+      <div class="card reveal"><div class="tag tpatch" data-i18n="tag.patch">Engine</div><h3 data-i18n="uh.c5t">Applicazione della patch</h3><p data-i18n="uh.c5d">Tre strade in base all'engine: riscrittura dei file con re-impacchettamento, injection a runtime (BepInEx + XUnity.AutoTranslator o hook DLL su Windows), oppure overlay OCR a schermo per i retro e RPG Maker classico. Backup automatico prima di ogni scrittura.</p></div>
+      <div class="card reveal"><div class="tag tcore" data-i18n="tag.core">Core</div><h3 data-i18n="uh.c6t">Sicurezza & aggiornamenti</h3><p data-i18n="uh.c6d">Un gate anti-cheat (invariante) blocca l'injection sui giochi online (EAC/BattlEye). Dopo gli aggiornamenti del gioco su Steam, l'update tracker ricontrolla l'integrità della patch e ti avvisa se serve ri-applicarla.</p></div>
+    </div>
+    <p class="sub reveal" style="margin-top:18px;font-size:13px;color:var(--faint)" data-i18n="uh.note">Le traduzioni finite diventano pacchetti .gspack condivisibili nel Patch Hub: pubblichi le tue e scarichi quelle della community.</p>
+  </div>
+</section>
+
+<section id="sicurezza" style="background:rgba(255,255,255,.015)">
+  <div class="container">
+    <span class="label core reveal" data-i18n="sec.label">// Sicurezza &amp; garanzie</span>
+    <h2 class="h2 reveal" data-i18n="sec.h2">Prima tocca i file, poi li protegge</h2>
+    <p class="sub reveal" data-i18n="sec.sub">Ogni patch è reversibile per design: backup prima di scrivere, verifica dopo, e un controllo a ogni aggiornamento del gioco.</p>
+    <div class="arch reveal">
+      <svg viewBox="0 0 1000 280" role="img" aria-label="Safety flow: backup, apply, verify, update tracker, plus anti-cheat gate">
+        <defs>
+          <marker id="ahg" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#9aa6bd"/></marker>
+        </defs>
+        <line x1="237" y1="92" x2="256" y2="92" stroke="#9aa6bd" stroke-width="2" marker-end="url(#ahg)"/>
+        <line x1="487" y1="92" x2="506" y2="92" stroke="#9aa6bd" stroke-width="2" marker-end="url(#ahg)"/>
+        <line x1="737" y1="92" x2="756" y2="92" stroke="#9aa6bd" stroke-width="2" marker-end="url(#ahg)"/>
+        <rect x="12" y="58" width="225" height="68" rx="12" fill="rgba(16,185,129,.14)" stroke="#10b981"/>
+        <text x="124" y="90" text-anchor="middle" fill="#6ee7b7" font-size="15" font-weight="700" data-i18n="sec.n1">Backup</text>
+        <text x="124" y="110" text-anchor="middle" fill="#9aa6bd" font-size="11" data-i18n="sec.n1s">prima di ogni scrittura</text>
+        <rect x="262" y="58" width="225" height="68" rx="12" fill="rgba(56,189,248,.14)" stroke="#3b82f6"/>
+        <text x="374" y="90" text-anchor="middle" fill="#7dd3fc" font-size="15" font-weight="700" data-i18n="sec.n2">Applica patch</text>
+        <text x="374" y="110" text-anchor="middle" fill="#9aa6bd" font-size="11" data-i18n="sec.n2s">file o runtime</text>
+        <rect x="512" y="58" width="225" height="68" rx="12" fill="rgba(16,185,129,.14)" stroke="#10b981"/>
+        <text x="624" y="90" text-anchor="middle" fill="#6ee7b7" font-size="15" font-weight="700" data-i18n="sec.n3">Verifica</text>
+        <text x="624" y="110" text-anchor="middle" fill="#9aa6bd" font-size="11" data-i18n="sec.n3s">integrità della patch</text>
+        <rect x="762" y="58" width="226" height="68" rx="12" fill="rgba(139,92,246,.14)" stroke="#8b5cf6"/>
+        <text x="875" y="86" text-anchor="middle" fill="#c4b5fd" font-size="15" font-weight="700" data-i18n="sec.n4">Update tracker</text>
+        <text x="875" y="106" text-anchor="middle" fill="#9aa6bd" font-size="11" data-i18n="sec.n4s">ri-controlla dopo gli update e ti avvisa</text>
+        <rect x="12" y="176" width="976" height="76" rx="14" fill="rgba(245,158,11,.10)" stroke="#f59e0b"/>
+        <text x="40" y="208" fill="#fcd34d" font-size="15" font-weight="700" data-i18n="sec.gate">🛡 Gate anti-cheat (invariante)</text>
+        <text x="40" y="232" fill="#cbd5e1" font-size="12.5" data-i18n="sec.gates">Blocca l'injection sui giochi online (EAC/BattlEye). Solo single-player/offline.</text>
+      </svg>
+    </div>
+  </div>
+</section>
+
+<section id="guida-cta" style="padding:48px 0">
+  <div class="container">
+    <div class="reveal" style="position:relative;overflow:hidden;border-radius:22px;padding:44px 34px;text-align:center;
+      background:linear-gradient(135deg,rgba(139,92,246,.16),rgba(99,102,241,.10) 50%,rgba(56,189,248,.10));
+      border:1px solid rgba(139,92,246,.35)">
+      <div style="position:absolute;inset:0;pointer-events:none;background:radial-gradient(32rem 16rem at 50% -20%,rgba(139,92,246,.25),transparent 70%)"></div>
+      <span class="label core" data-i18n="gcta.label">// Manuale utente</span>
+      <h2 class="h2" style="margin-top:10px" data-i18n="gcta.h2">Scaricato? Ora impara a usarlo in 5 minuti</h2>
+      <p class="sub" style="margin:8px auto 0;max-width:720px" data-i18n="gcta.sub">La guida interattiva ti porta dal primo avvio al primo gioco tradotto: mappa dell'app, simulatore del flusso di traduzione, P.T., Patch Hub e soluzioni ai problemi comuni.</p>
+      <div class="cta" style="margin-top:26px">
+        <a class="btn btn-primary" href="guida.html" data-i18n="gcta.btn">📖 Apri la guida interattiva</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="funzioni">
+  <div class="container">
+    <span class="label trad reveal" data-i18n="fn.label">// Funzioni principali</span>
+    <h2 class="h2 reveal" data-i18n="fn.h2">Una suite completa, non un semplice traduttore</h2>
+    <div class="grid">
+      <div class="card reveal"><div class="tag tcore" data-i18n="tag.core">Core</div><h3 data-i18n="f1.t">P.T. — Prediction Tool</h3><p data-i18n="f1.d">Analisi predittiva prima di tradurre: difficoltà, DRM, encoding, complessità linguistica e catene di modelli consigliate (Locale, Cloud, Ibrida, Budget, Premium).</p></div>
+      <div class="card reveal"><div class="tag tcore" data-i18n="tag.core">Core</div><h3 data-i18n="f2.t">Dry Run & P.T.Rank</h3><p data-i18n="f2.d">Scansiona l'intera libreria installata, senza limiti di numero e senza toccare nulla, e ordina i titoli per difficoltà per pianificare la coda di lavoro.</p></div>
+      <div class="card reveal"><div class="tag ttrad" data-i18n="tag.trad">Traduzione</div><h3 data-i18n="f3.t">20+ provider AI</h3><p data-i18n="f3.d">OpenAI, Claude, Gemini, DeepSeek, Groq, DeepL, Ollama (locale) e altri. Auto-Select per lingua e genere del gioco.</p></div>
+      <div class="card reveal"><div class="tag ttrad" data-i18n="tag.trad">Traduzione</div><h3 data-i18n="f4.t">Translation Memory & Glossario</h3><p data-i18n="f4.d">Database locale che impara dalle tue correzioni, con estrazione automatica di nomi e termini per la coerenza.</p></div>
+      <div class="card reveal"><div class="tag ttrad" data-i18n="tag.trad">Traduzione</div><h3 data-i18n="f5.t">Quality gate 0–100</h3><p data-i18n="f5.d">Punteggio di qualità automatico su ogni stringa e heatmap visiva: vedi a colpo d'occhio dove serve una revisione umana.</p></div>
+      <div class="card reveal"><div class="tag tpatch" data-i18n="tag.patch">Engine</div><h3 data-i18n="f6.t">Patcher nativi</h3><p data-i18n="f6.d">12 engine con parser dedicato e oltre 20 riconosciuti, con wizard a step condiviso e backup automatico prima di ogni patch.</p></div>
+      <div class="card reveal"><div class="tag tpatch" data-i18n="tag.patch">Engine</div><h3 data-i18n="f7.t">Unity auto-setup</h3><p data-i18n="f7.d">Per i giochi Unity senza testo estraibile, installa BepInEx + XUnity.AutoTranslator con un clic.</p></div>
+      <div class="card reveal"><div class="tag tres" data-i18n="tag.res">Strumenti</div><h3 data-i18n="f8.t">OCR & Overlay</h3><p data-i18n="f8.d">Traduzione a schermo per giochi retro e RPG Maker classico, con preprocessing dedicato e backend Tesseract.</p></div>
+      <div class="card reveal"><div class="tag tres" data-i18n="tag.res">Strumenti</div><h3 data-i18n="f9.t">Libreria & aggiunta manuale</h3><p data-i18n="f9.d">Rilevamento automatico da Steam/Epic/GOG e aggiunta manuale di un gioco selezionando la cartella dal disco.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="engine" style="background:rgba(255,255,255,.015)">
+  <div class="container">
+    <span class="label patch reveal" data-i18n="eng.label">// Engine supportati</span>
+    <h2 class="h2 reveal" data-i18n="eng.h2">12 engine con parser dedicato, oltre 20 riconosciuti</h2>
+    <p class="sub reveal" data-i18n="eng.sub">Copertura verificata sul codice: patcher con test su fixture, più moduli runtime per i casi che richiedono injection.</p>
+    <div class="reveal" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px;margin-bottom:22px">
+      <div style="padding:18px;border-radius:16px;background:rgba(16,185,129,.06);border:1px solid rgba(16,185,129,.25)">
+        <div style="font-weight:800;color:#6ee7b7;margin-bottom:2px" data-i18n="cov.m1">Parser su file</div>
+        <div style="font-size:12px;color:var(--muted);margin-bottom:10px" data-i18n="cov.m1d">parsing e riscrittura dei file nativi</div>
+        <div style="font-size:13px;color:var(--text);line-height:1.7">Unity · Unreal · Godot · RPG Maker MV/MZ · Ren'Py · Bethesda · CRI · GameMaker · Wolf RPG · TyranoScript · Visionaire · Danganronpa</div>
+      </div>
+      <div style="padding:18px;border-radius:16px;background:rgba(245,158,11,.06);border:1px solid rgba(245,158,11,.25)">
+        <div style="font-weight:800;color:#fcd34d;margin-bottom:2px" data-i18n="cov.m2">Injection a runtime</div>
+        <div style="font-size:12px;color:var(--muted);margin-bottom:10px" data-i18n="cov.m2d">quando non c'è testo estraibile (Windows)</div>
+        <div style="font-size:13px;color:var(--text);line-height:1.7">Unity IL2CPP → BepInEx + XUnity.AutoTranslator · hook DLL · overlay live</div>
+      </div>
+      <div style="padding:18px;border-radius:16px;background:rgba(56,189,248,.06);border:1px solid rgba(56,189,248,.25)">
+        <div style="font-weight:800;color:#7dd3fc;margin-bottom:2px" data-i18n="cov.m3">OCR a schermo</div>
+        <div style="font-size:12px;color:var(--muted);margin-bottom:10px" data-i18n="cov.m3d">testo non estraibile, retro e classici</div>
+        <div style="font-size:13px;color:var(--text);line-height:1.7">RPG Maker 2000/2003 (RPG_RT) · giochi retro / DOS</div>
+      </div>
+    </div>
+    <div class="engines">
+      <div class="eng reveal"><h4>Unity</h4><small>assets · StringTable · BepInEx</small><div class="ok">Full</div></div>
+      <a class="eng reveal" href="unreal.html" style="display:block;text-decoration:none;color:inherit"><h4>Unreal</h4><small>.locres · _P.pak · IoStore</small><div class="part" data-i18n="eng.partial">Parziale</div></a>
+      <div class="eng reveal"><h4>Godot</h4><small>.pck · .translation</small><div class="ok">Full</div></div>
+      <div class="eng reveal"><h4>RPG Maker</h4><small>MV · MZ · VX/Ace · 2k OCR</small><div class="ok">Full</div></div>
+      <div class="eng reveal"><h4>Ren'Py</h4><small>.rpy · dialoghi</small><div class="ok">Full</div></div>
+      <div class="eng reveal"><h4>Bethesda</h4><small>BSA/BA2 · ESP/ESM</small><div class="ok">Full</div></div>
+      <div class="eng reveal"><h4>CRI Middleware</h4><small>CPK · CRILAYLA · MSG/BMD</small><div class="ok">Full</div></div>
+      <div class="eng reveal"><h4>GameMaker</h4><small>UndertaleModTool</small><div class="part" data-i18n="eng.partial">Parziale</div></div>
+      <div class="eng reveal"><h4>Wolf RPG</h4><small>WolfTrans</small><div class="ok">Full</div></div>
+      <div class="eng reveal"><h4>TyranoScript</h4><small>fast-path JSON</small><div class="ok">Full</div></div>
+      <div class="eng reveal"><h4>Visionaire</h4><small>Daedalic adventures</small><div class="ok">Full</div></div>
+      <div class="eng reveal"><h4>Danganronpa</h4><small>WAD · STX</small><div class="ok">Full</div></div>
+    </div>
+    <p class="reveal" style="margin-top:18px;font-size:12.5px;color:var(--faint)" data-i18n="eng.unrealnote">Unreal: la lettura dei container IoStore (.utoc/.ucas) è completa, ma la riscrittura è ancora parziale e passa da un container di override _P (ADR-002). GameMaker: la riscrittura avviene a lunghezza invariata, quindi le traduzioni più lunghe dell'originale vengono troncate e segnalate.</p>
+    <p class="reveal" style="margin-top:10px;font-size:13.5px"><a href="unreal.html" data-i18n="eng.unreallink">Come funziona su Unreal Engine, in dettaglio →</a></p>
+  </div>
+</section>
+
+<section id="ai">
+  <div class="container">
+    <span class="label trad reveal" data-i18n="ai.label">// Provider AI</span>
+    <h2 class="h2 reveal" data-i18n="ai.h2">Scegli il cervello che preferisci</h2>
+    <p class="sub reveal" data-i18n="ai.sub">Dalla privacy totale in locale alla massima qualità cloud. Puoi mescolarli e confrontare i risultati riga per riga.</p>
+    <div class="arch reveal" style="margin-bottom:26px">
+      <svg viewBox="0 0 1000 210" role="img" aria-label="AI provider spectrum from local/privacy to cloud/quality">
+        <defs>
+          <linearGradient id="gSpec" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#10b981"/><stop offset="1" stop-color="#3b82f6"/></linearGradient>
+        </defs>
+        <rect x="40" y="92" width="920" height="14" rx="7" fill="url(#gSpec)"/>
+        <text x="40" y="78" fill="#6ee7b7" font-size="13" font-weight="700" data-i18n="spec.left">◀ Locale · Privacy · zero costi</text>
+        <text x="960" y="78" text-anchor="end" fill="#7dd3fc" font-size="13" font-weight="700" data-i18n="spec.right">Cloud · Massima qualità ▶</text>
+        <g font-size="12.5" fill="#e8ebf2" text-anchor="middle">
+          <circle cx="120" cy="99" r="5" fill="#10b981"/><text x="120" y="135">Ollama</text><text x="120" y="153" fill="#9aa6bd" font-size="10.5">LM Studio</text>
+          <circle cx="330" cy="99" r="5" fill="#22c55e"/><text x="330" y="135">DeepSeek</text><text x="330" y="153" fill="#9aa6bd" font-size="10.5">Groq · Gemini Flash</text>
+          <circle cx="560" cy="99" r="5" fill="#38bdf8"/><text x="560" y="135">DeepL</text><text x="560" y="153" fill="#9aa6bd" font-size="10.5">Mistral Large</text>
+          <circle cx="800" cy="99" r="5" fill="#3b82f6"/><text x="800" y="135">GPT-4o · Claude</text><text x="800" y="153" fill="#9aa6bd" font-size="10.5">Gemini Pro</text>
+        </g>
+        <text x="500" y="190" text-anchor="middle" fill="#9aa6bd" font-size="12.5" data-i18n="spec.cap">Una catena con fallback automatico tra provider — e confronto riga per riga in Multi-LLM.</text>
+      </svg>
+    </div>
+    <div class="tablewrap reveal">
+      <table>
+        <thead><tr><th data-i18n="ai.th1">Provider</th><th data-i18n="ai.th2">Modello consigliato</th><th data-i18n="ai.th3">Tipo</th><th data-i18n="ai.th4">Ideale per</th></tr></thead>
+        <tbody>
+          <tr><td><strong>Ollama</strong></td><td>Llama 3 · Gemma · Qwen 3</td><td><span class="badge b-local" data-i18n="ai.local">Locale</span></td><td data-i18n="ai.r1">Privacy totale, zero costi API</td></tr>
+          <tr><td><strong>Claude</strong></td><td>Claude 3.5 Sonnet</td><td><span class="badge b-cloud">Cloud</span></td><td data-i18n="ai.r2">Sfumature narrative, stile letterario, CJK</td></tr>
+          <tr><td><strong>OpenAI</strong></td><td>GPT-4o</td><td><span class="badge b-cloud">Cloud</span></td><td data-i18n="ai.r3">Logica complessa e istruzioni di sistema</td></tr>
+          <tr><td><strong>Gemini</strong></td><td>Gemini 1.5 Pro</td><td><span class="badge b-cloud">Cloud</span></td><td data-i18n="ai.r4">Script lunghissimi (contesto enorme)</td></tr>
+          <tr><td><strong>DeepSeek</strong></td><td>DeepSeek-V4 Flash</td><td><span class="badge b-cloud">Economy</span></td><td data-i18n="ai.r5">Miglior rapporto qualità/prezzo</td></tr>
+          <tr><td><strong>DeepL</strong></td><td>DeepL API</td><td><span class="badge b-cloud">Cloud</span></td><td data-i18n="ai.r6">Lingue europee, traduzione pulita</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section id="community">
+  <div class="container">
+    <span class="label res reveal" data-i18n="com.label">// Community & Patch Hub</span>
+    <h2 class="h2 reveal" data-i18n="com.h2">Condividi le tue traduzioni, scarica quelle degli altri</h2>
+    <p class="sub reveal" data-i18n="com.sub">Le traduzioni finite diventano pacchetti .gspack: pubblicale nel Patch Hub o scarica quelle della community e applicale al gioco — con backup, come sempre.</p>
+    <div class="arch reveal">
+      <svg viewBox="0 0 1000 300" role="img" aria-label="Community translation flow: translate, publish, Patch Hub, download, apply, with a reputation loop">
+        <defs>
+          <marker id="ah" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#9aa6bd"/></marker>
+        </defs>
+        <line x1="187" y1="102" x2="205" y2="102" stroke="#9aa6bd" stroke-width="2" marker-end="url(#ah)"/>
+        <line x1="384" y1="102" x2="402" y2="102" stroke="#9aa6bd" stroke-width="2" marker-end="url(#ah)"/>
+        <line x1="581" y1="102" x2="599" y2="102" stroke="#9aa6bd" stroke-width="2" marker-end="url(#ah)"/>
+        <line x1="778" y1="102" x2="796" y2="102" stroke="#9aa6bd" stroke-width="2" marker-end="url(#ah)"/>
+        <rect x="12" y="70" width="175" height="64" rx="12" fill="rgba(16,185,129,.14)" stroke="#10b981"/>
+        <text x="99" y="100" text-anchor="middle" fill="#6ee7b7" font-size="15" font-weight="700" data-i18n="com.n1">Traduci</text>
+        <text x="99" y="120" text-anchor="middle" fill="#9aa6bd" font-size="11" data-i18n="com.n1s">con l'AI nel tuo gioco</text>
+        <rect x="209" y="70" width="175" height="64" rx="12" fill="rgba(245,158,11,.14)" stroke="#f59e0b"/>
+        <text x="296" y="100" text-anchor="middle" fill="#fcd34d" font-size="15" font-weight="700" data-i18n="com.n2">Pubblica .gspack</text>
+        <text x="296" y="120" text-anchor="middle" fill="#9aa6bd" font-size="11" data-i18n="com.n2s">nome, gioco, lingue, file</text>
+        <rect x="406" y="70" width="175" height="64" rx="12" fill="rgba(245,158,11,.14)" stroke="#f59e0b"/>
+        <text x="493" y="100" text-anchor="middle" fill="#fcd34d" font-size="15" font-weight="700" data-i18n="com.n3">Patch Hub</text>
+        <text x="493" y="120" text-anchor="middle" fill="#9aa6bd" font-size="11" data-i18n="com.n3s">moderazione → pubblico</text>
+        <rect x="603" y="70" width="175" height="64" rx="12" fill="rgba(56,189,248,.14)" stroke="#3b82f6"/>
+        <text x="690" y="100" text-anchor="middle" fill="#7dd3fc" font-size="15" font-weight="700" data-i18n="com.n4">Scarica</text>
+        <text x="690" y="120" text-anchor="middle" fill="#9aa6bd" font-size="11" data-i18n="com.n4s">in libreria pack locale</text>
+        <rect x="800" y="70" width="175" height="64" rx="12" fill="rgba(16,185,129,.14)" stroke="#10b981"/>
+        <text x="887" y="100" text-anchor="middle" fill="#6ee7b7" font-size="15" font-weight="700" data-i18n="com.n5">Applica al gioco</text>
+        <text x="887" y="120" text-anchor="middle" fill="#9aa6bd" font-size="11" data-i18n="com.n5s">backup automatico</text>
+        <path d="M887,134 C887,210 700,240 500,240 C300,240 99,210 99,134" fill="none" stroke="#8b5cf6" stroke-width="2" stroke-dasharray="5 5" marker-end="url(#ah)"/>
+        <rect x="343" y="222" width="314" height="34" rx="10" fill="rgba(139,92,246,.12)" stroke="#8b5cf6"/>
+        <text x="500" y="244" text-anchor="middle" fill="#c4b5fd" font-size="12.5" font-weight="600" data-i18n="com.loop">Reputazione · Verified translator · passaparola</text>
+      </svg>
+    </div>
+    <p class="sub reveal" style="margin-top:18px;font-size:13px;color:var(--faint)" data-i18n="com.note">Sfogli i pack per gioco, lingua, rating e completamento. Il backend è su Supabase e le patch sono artefatti di prima classe, non allegati in chat.</p>
+  </div>
+</section>
+
+<section id="novita" style="background:rgba(255,255,255,.015)">
+  <div class="container">
+    <span class="label res reveal" data-i18n="news.label">// Novità v1.17.0</span>
+    <h2 class="h2 reveal" data-i18n="news.h2">Tre motori che prima si arrendevano</h2>
+    <div class="news">
+      <div class="newcard reveal"><h3 data-i18n="n1.t">🎓 Danganronpa tradotto da cima a fondo</h3><p data-i18n="n1.d">DR1 si traduce interamente dentro l'app: estrazione dal .wad, traduzione e ricostruzione dell'archivio. Le lettere accentate finiscono nel font del gioco, verificate prima di scrivere.</p></div>
+      <div class="newcard reveal"><h3 data-i18n="n2.t">📜 Ren'Py e Godot aprono i loro archivi</h3><p data-i18n="n2.d">Gli script che i giochi Ren'Py nascondono nei .rpa ora si leggono: Scarlet Hollow, 83.489 stringhe. E i .pck di Godot, che prima davano zero file con la spunta verde, vengono aperti davvero.</p></div>
+      <div class="newcard reveal"><h3 data-i18n="n3.t">⚖️ Locale o Online, scelto una volta</h3><p data-i18n="n3.d">Una scelta globale decide se tradurre con l'AI sul tuo computer o nel cloud, con override per singolo gioco. RPG Maker, Visionaire e Tyrano ora la rispettano invece di decidere da soli.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="fatti" style="padding:40px 0">
+  <div class="container">
+    <div class="reveal" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:14px">
+      <div style="padding:16px 18px;border-radius:14px;background:var(--surface);border:1px solid var(--border)">
+        <div style="font-size:1.05rem;font-weight:800;color:var(--patch2)" data-i18n="trust.i1">Gratis</div>
+        <div style="font-size:12.5px;color:var(--muted);margin-top:3px" data-i18n="trust.i1s">le prime 500 stringhe per ogni progetto</div>
+      </div>
+      <div style="padding:16px 18px;border-radius:14px;background:var(--surface);border:1px solid var(--border)">
+        <div style="font-size:1.05rem;font-weight:800;color:var(--trad2)" data-i18n="trust.i2">Source-available</div>
+        <div style="font-size:12.5px;color:var(--muted);margin-top:3px" data-i18n="trust.i2s">codice pubblico su GitHub</div>
+      </div>
+      <div style="padding:16px 18px;border-radius:14px;background:var(--surface);border:1px solid var(--border)">
+        <div style="font-size:1.05rem;font-weight:800;color:var(--core)" data-i18n="trust.i3">Windows · Linux · macOS</div>
+        <div style="font-size:12.5px;color:var(--muted);margin-top:3px" data-i18n="trust.i3s">auto-update firmato</div>
+      </div>
+      <div style="padding:16px 18px;border-radius:14px;background:var(--surface);border:1px solid var(--border)">
+        <div style="font-size:1.05rem;font-weight:800;color:var(--res2)" data-i18n="trust.i4">12 lingue UI</div>
+        <div style="font-size:12.5px;color:var(--muted);margin-top:3px" data-i18n="trust.i4s">interfaccia completamente localizzata</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="faq">
+  <div class="container">
+    <span class="label core reveal" data-i18n="faq.label">// Domande frequenti</span>
+    <h2 class="h2 reveal" data-i18n="faq.h2">FAQ</h2>
+    <div class="reveal">
+      <details><summary data-i18n="faq.q1">È gratuito?</summary><p data-i18n="faq.a1">GameStringer è source-available. Le prime 500 stringhe di ogni progetto sono libere; per progetti più grandi è previsto un sistema basato sull'onore con donazione libera.</p></details>
+      <details><summary data-i18n="faq.q2">Funziona con i giochi Steam, Epic, GOG?</summary><p data-i18n="faq.a2">Sì: rileva automaticamente i giochi installati dai tuoi store (Steam, Epic, GOG e altri) e ti guida nell'applicazione delle patch. Puoi anche aggiungere un gioco manualmente dal disco.</p></details>
+      <details><summary data-i18n="faq.q3">Posso tradurre senza pagare API?</summary><p data-i18n="faq.a3">Sì, con Ollama esegui modelli come Llama 3, Gemma o Qwen direttamente sulla tua GPU: privacy totale e zero costi.</p></details>
+      <details><summary data-i18n="faq.q4">È sicuro per i giochi online?</summary><p data-i18n="faq.a4">L'injection a runtime può far scattare gli anti-cheat. Usa GameStringer su giochi single-player/offline: il P.T. rileva DRM e anti-cheat e ti avvisa prima di modificare qualsiasi cosa. I file vengono sempre salvati in backup.</p></details>
+      <details><summary data-i18n="faq.q5">Su quali sistemi gira?</summary><p data-i18n="faq.a5">Windows 10+, Linux (Ubuntu 22.04+/Fedora 38+) e macOS 10.15+. Le release sono firmate e si aggiornano automaticamente.</p></details>
+    </div>
+    <div class="cta" style="margin-top:40px">
+      <a class="btn btn-primary" href="https://github.com/rouges78/GameStringer/releases/latest" target="_blank" rel="noopener" data-i18n="faq.cta1">⬇ Scarica GameStringer</a>
+      <a class="btn btn-ghost" href="https://github.com/rouges78/GameStringer" target="_blank" rel="noopener" data-i18n="faq.cta2">★ Codice su GitHub</a>
+    </div>
+  </div>
+</section>
+
+<section id="dev-note" style="background:rgba(255,255,255,.015)">
+  <div class="container">
+    <div class="reveal" style="position:relative;overflow:hidden;border-radius:22px;padding:40px 32px;
+      background:linear-gradient(135deg,rgba(139,92,246,.14),rgba(56,189,248,.08));
+      border:1px solid rgba(139,92,246,.30)">
+      <div style="position:absolute;inset:0;pointer-events:none;background:radial-gradient(30rem 14rem at 50% -20%,rgba(139,92,246,.22),transparent 70%)"></div>
+      <span class="label core" data-i18n="dev.label">// Una nota dallo sviluppatore</span>
+      <h2 class="h2" style="margin-top:10px" data-i18n="dev.h2">Un progetto di una persona sola — abbiate pazienza 💜</h2>
+      <p class="sub" style="max-width:760px" data-i18n="dev.p1">GameStringer è sviluppato da una persona sola — io — e convivo con il Parkinson, quindi a volte gli aggiornamenti arrivano più lentamente di quanto vorrei. Grazie di cuore per la pazienza.</p>
+      <p class="sub" style="max-width:760px" data-i18n="dev.p2">Non lo faccio per soldi: voglio solo cambiare la rotta delle traduzioni dei videogiochi e mettere in mano ai giocatori uno strumento davvero utile.</p>
+      <p class="sub" style="max-width:760px" data-i18n="dev.p3">🎮 Il Discord è aperto! Un posto dove parlarne insieme, scambiare idee e migliorare tutto — renderlo unico. Ti aspetto.</p>
+      <p style="margin-top:16px">
+        <a class="btn btn-primary" href="https://discord.gg/SjnD3Z7Uf8" target="_blank" rel="noopener" style="background:linear-gradient(135deg,#5865F2,#4752c4)" data-i18n="dev.discord">💬 Unisciti al Discord</a>
+      </p>
+      <p class="sub" style="margin-top:14px;color:var(--faint)" data-i18n="dev.sign">— Davide (rouges78)</p>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="container">
+    <a class="brand" href="#top" style="justify-content:center"><img class="dot" src="logo.png" alt="GameStringer"> <span class="brandname">GameStringer</span></a>
+    <div class="flinks">
+      <a href="https://github.com/rouges78/GameStringer" target="_blank" rel="noopener">GitHub</a>
+      <a href="guida.html" data-i18n="nav.guide">Guida</a>
+      <a href="https://github.com/rouges78/GameStringer/releases/latest" target="_blank" rel="noopener" data-i18n="foot.dl">Download</a>
+      <a href="https://github.com/rouges78/GameStringer/discussions" target="_blank" rel="noopener" data-i18n="foot.comm">Community</a>
+      <a href="https://github.com/rouges78/GameStringer/blob/main/docs/LEGAL.md" target="_blank" rel="noopener" data-i18n="foot.legal">Note legali</a>
+      <a href="dmca.html">DMCA / Anti-pirateria</a>
+      <a href="publisher.html">Publisher</a>
+      <a href="https://ko-fi.com/gamestringer" target="_blank" rel="noopener">Ko-fi</a>
+    </div>
+    <p data-i18n="foot.tagline">Abbatti le barriere linguistiche dei videogiochi. Analizza, traduci, gioca.</p>
+    <p class="copy">© 2025–2026 GameStringer by rouges78 · Source-Available License</p>
+  </div>
+</footer>
+
+<script src="site-v2-i18n.js"></script>
+<script>
+  // Reveal on scroll
+  const io=new IntersectionObserver((es)=>{es.forEach(e=>{if(e.isIntersecting){e.target.classList.add('in');io.unobserve(e.target)}})},{threshold:.12});
+  document.querySelectorAll('.reveal').forEach((el,i)=>{el.style.transitionDelay=(Math.min(i%6,5)*60)+'ms';io.observe(el)});
+
+  // i18n
+  const I18N = window.GS_I18N || {};
+  function applyLang(lang){
+    const dict = I18N[lang] || I18N.it || {};
+    document.documentElement.lang = lang;
+    document.querySelectorAll('[data-i18n]').forEach(el=>{
+      const k=el.getAttribute('data-i18n'); if(dict[k]!=null) el.textContent=dict[k];
+    });
+    document.querySelectorAll('[data-i18n-html]').forEach(el=>{
+      const k=el.getAttribute('data-i18n-html'); if(dict[k]!=null) el.innerHTML=dict[k];
+    });
+    try{localStorage.setItem('gs_site_lang',lang)}catch(e){}
+    const sel=document.getElementById('langSel'); if(sel) sel.value=lang;
+  }
+  (function initLang(){
+    const supported=['it','en','es','fr','de','pt','pl','ru','ja','zh','ko','el'];
+    let lang='it';
+    try{const s=localStorage.getItem('gs_site_lang'); if(s&&supported.includes(s)) lang=s; else{const b=(navigator.language||'it').slice(0,2).toLowerCase(); if(supported.includes(b)) lang=b;}}catch(e){}
+    const sel=document.getElementById('langSel');
+    if(sel){sel.value=lang; sel.addEventListener('change',e=>applyLang(e.target.value));}
+    if(lang!=='it') applyLang(lang);
+    else if(sel) sel.value='it';
+  })();
+</script>
+</body>
+</html>

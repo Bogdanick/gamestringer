@@ -1,0 +1,575 @@
+<p align="center">
+  <img src="public/logo.png" alt="GameStringer Logo" width="180" />
+</p>
+
+<h1 align="center">GameStringer</h1>
+
+<p align="center">
+  <strong>Aplicativo de desktop que traduz videogames para qualquer idioma usando IA.</strong><br>
+  Escolha um jogo da sua biblioteca, selecione um idioma, clique em traduzir — pronto.
+</p>
+
+<p align="center">
+  <a href="https://www.gamestringer.ai"><img src="https://img.shields.io/badge/🌐_Site-gamestringer.ai-indigo" alt="Website" /></a>
+  <a href="https://discord.gg/SjnD3Z7Uf8"><img src="https://img.shields.io/badge/Discord-Entrar-5865F2?logo=discord&logoColor=white" alt="Discord" /></a>
+  <img src="https://img.shields.io/badge/version-1.15.0-blue" alt="Version" />
+  <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey" alt="Platform" />
+  <img src="https://img.shields.io/badge/license-Source--Available-green" alt="License" />
+  <img src="https://img.shields.io/badge/Tauri_2-24C8DB?logo=tauri&logoColor=white" alt="Tauri" />
+  <img src="https://img.shields.io/badge/Next.js_15-black?logo=next.js" alt="Next.js" />
+  <img src="https://img.shields.io/badge/Rust-orange?logo=rust&logoColor=white" alt="Rust" />
+</p>
+
+<p align="center">
+  <a href="https://www.gamestringer.ai">Site</a> ·
+  <a href="https://discord.gg/SjnD3Z7Uf8"><strong>💬 Discord</strong></a> ·
+  <a href="#procura-se-ajuda"><strong>🙏 Procura-se ajuda</strong></a> ·
+  <a href="#-o-que-é-o-gamestringer">O que é</a> ·
+  <a href="#-download">Download</a> ·
+  <a href="#-como-funciona">Como funciona</a> ·
+  <a href="#-o-prediction-tool-pt">P.T.</a> ·
+  <a href="#-motores-de-jogo-suportados">Motores</a> ·
+  <a href="#-recursos">Recursos</a> ·
+  <a href="#-compilar-a-partir-do-código-fonte">Build</a>
+</p>
+
+> ⚠️ **Atualizando da v1.8.x?** A v1.9.0 migrou de Tauri v1 para **Tauri v2** — o auto-atualizador não funciona nesse salto. Baixe a **v1.9.1** manualmente: [GameStringer_1.9.1_x64-setup.exe](https://github.com/rouges78/GameStringer/releases/download/v1.9.1/GameStringer_1.9.1_x64-setup.exe). Atualizações futuras (v1.9.1 → v1.9.x) funcionarão automaticamente.
+
+<p align="center">
+  <strong>🌍 Disponível em 12 idiomas</strong> — troque de idioma dentro do app (IT, EN, ES, FR, DE, PT, PL, RU, JA, ZH, KO, EL) ou no <a href="https://www.gamestringer.ai">site</a> (11 idiomas).
+</p>
+
+<p align="center">
+  <strong>🌍 Leia no seu idioma:</strong><br>
+  <a href="README.md">🇬🇧 English</a> ·
+  <a href="README_IT.md">🇮🇹 Italiano</a> ·
+  <a href="README_ES.md">🇪🇸 Español</a> ·
+  <a href="README_FR.md">🇫🇷 Français</a> ·
+  <a href="README_DE.md">🇩🇪 Deutsch</a> ·
+  🇧🇷 Português ·
+  <a href="README_JA.md">🇯🇵 日本語</a> ·
+  <a href="README_ZH.md">🇨🇳 中文</a> ·
+  <a href="README_KO.md">🇰🇷 한국어</a> ·
+  <a href="README_RU.md">🇷🇺 Русский</a> ·
+  <a href="README_PL.md">🇵🇱 Polski</a>
+</p>
+
+---
+
+> ### 💜 Uma nota do desenvolvedor
+>
+> O GameStringer é construído por **uma única pessoa — eu — e eu tenho Parkinson**, então as atualizações às vezes demoram mais do que eu gostaria. **Obrigado pela sua paciência.** **Não faço isso por dinheiro**: só quero mudar a forma como a tradução de jogos funciona e colocar nas mãos dos jogadores uma ferramenta genuinamente útil. **O Discord agora está aberto** 🎉 — [venha se juntar a nós](https://discord.gg/SjnD3Z7Uf8) para que possamos conversar, trocar ideias e melhorar o GameStringer, juntos. 🙏
+>
+> — *Davide ([@rouges78](https://github.com/rouges78))*
+
+---
+
+<a name="procura-se-ajuda"></a>
+
+## 🙏 Procura-se ajuda — Teste em jogos reais e envie feedback
+
+> **O GameStringer é um projeto solo, source-available, e ainda é jovem.** Já reconhece 20+ motores (12 com parser dedicado), mas jogos reais são bagunçados — cada título armazena seu texto de um jeito um pouco diferente. **A coisa mais útil que você pode fazer agora é rodar o GameStringer em um jogo real e me contar o que aconteceu.** Até um *"falhou no passo X"* vale ouro.
+
+**Por que isso importa:** não consigo testar sozinho os milhares de jogos que existem. **Testes e feedback** contínuos, do mundo real, são o que transforma *"funciona nas minhas fixtures"* em *"funciona no seu jogo."* Seus relatos moldam diretamente o roadmap — é a parte em que a comunidade faz ou desfaz o projeto.
+
+### 🧪 Três formas de ajudar (escolha qualquer uma)
+
+- **🎮 Teste um jogo e relate.** Rode em algo da sua biblioteca e envie um [relatório de compatibilidade](https://github.com/rouges78/GameStringer/discussions) rápido — o motor foi detectado corretamente? o texto foi extraído? o patch foi aplicado e o jogo ainda inicia?
+- **📦 Compartilhe um pack.** Se uma tradução funciona, publique-a no **Patch Hub** do app para que outros possam usá-la — seu nome fica nela (reputação + "tradutor verificado").
+- **🛠️ Contribua.** Novos parsers de motores, correções de locale, scripts de QA — procure por `good first issue` no repo.
+
+### 📋 O que precisamos especialmente que seja testado e comentado
+
+- [ ] **Cobertura de motores em títulos reais** — Unity (Mono **e** IL2CPP), Unreal (`.locres`, `_P.pak`, IoStore), Godot, RPG Maker **MV/MZ**, Ren'Py, Bethesda (BSA/BA2/ESP), CRI (CPK), Wolf RPG, TyranoScript, Visionaire, Danganronpa
+- [ ] **RPG Maker clássico (2000/2003)** via o **overlay OCR** na tela — quão legível é o resultado?
+- [ ] **Codificação e códigos de controle** — acentos/CJK corretos no jogo, e tags/variáveis do jogo intactos?
+- [ ] **Fontes** — os scripts não latinos (CJK, cirílico, grego) são renderizados no jogo, ou é preciso trocar a fonte?
+- [ ] **Qualidade de tradução por idioma** — qual provedor de IA dá os melhores resultados para o seu idioma/gênero?
+- [ ] **Patch Hub** — publicação e download de packs `.gspack` de ponta a ponta
+- [ ] **Onboarding e UX no primeiro uso** — ficou claro como traduzir o seu primeiro jogo? o que confundiu?
+- [ ] **Update tracker** — após uma atualização da loja, ele sinalizou corretamente que o patch precisa ser reaplicado?
+
+### 📝 Modelo de relatório de compatibilidade (copiar-colar)
+
+```
+- Jogo / loja / versão:
+- Motor detectado (pelo GameStringer):
+- Passo alcançado: Scan / Detect / Extract / Translate / Patch / Jogado
+- Resultado: ✅ funciona / ⚠️ parcial / ❌ falha
+- Provedor de IA usado:
+- Idioma:
+- Notas (o que quebrou, codificação, capturas):
+- SO + versão do GameStringer:
+```
+
+**Onde postar:** [GitHub Discussions](https://github.com/rouges78/GameStringer/discussions) · o **Community Hub** do app (Suporte / Showcase / Solicitações) · bugs → [Issues](https://github.com/rouges78/GameStringer/issues).
+
+O GameStringer é gratuito e source-available; o site e os custos da IA saem do meu próprio bolso, então, se ele te poupar tempo, um café é bem-vindo, mas **nunca** esperado: [Buy Me a Coffee](https://buymeacoffee.com/gamestringer) · [Ko-fi](https://ko-fi.com/gamestringer) · [GitHub Sponsors](https://github.com/sponsors/rouges78).
+
+---
+
+## 🎮 O que é o GameStringer?
+
+> **Em palavras simples:** escolha um jogo → escolha o seu idioma → clique em um botão. O GameStringer encontra o texto do jogo, traduz com IA e coloca de volta — fazendo primeiro um backup. Sem modding, sem linha de comando, sem conhecimento técnico.
+
+O GameStringer é um **aplicativo de desktop** (Windows, Linux e macOS) que permite traduzir videogames que não têm o seu idioma.
+
+A maioria dos jogos armazena seu texto em arquivos — JSON, XML, CSV, `.locres`, `.rpy`, BSA/BA2, CPK, StringTables do Unity Localization e muitos outros formatos. O GameStringer **escaneia a pasta do jogo**, encontra esses arquivos, envia o texto por um **provedor de tradução de IA** de sua escolha (OpenAI, Claude, Gemini, DeepSeek, Ollama, 20+ outros) e **aplica o texto traduzido** de volta no jogo. Um clique, sem necessidade de conhecimento técnico.
+
+Para **jogos Unity** que prendem o texto em assets compilados, o GameStringer **instala automaticamente o BepInEx + XUnity.AutoTranslator** — sem configuração manual. Para **jogos da Bethesda** (Skyrim, Fallout, Starfield), ele faz parsing nativo de BSA/BA2/ESP. Para **jogos com CRI Middleware** (Persona, Yakuza), lida com CPK/CRILAYLA/MSG/BMD. Para **Unreal Engine**, edita `.locres` diretamente.
+
+**Não é um site de tradução automática.** É um pipeline completo: **analisar com P.T. → detectar motor → extrair texto → traduzir com IA → checar qualidade → aplicar patch → jogar.**
+
+---
+
+## 📥 Download
+
+Obtenha a última versão em **[GitHub Releases](https://github.com/rouges78/GameStringer/releases)**:
+
+| Plataforma | Arquivo | Observações |
+|----------|------|-------|
+| **Windows** | `GameStringer_1.15.0_x64-setup.exe` | Instalador (recomendado) |
+| **Windows** | `GameStringer_1.15.0_x64-portable.zip` | Sem instalação |
+| **Windows** | `GameStringer_1.15.0_x64_en-US.msi` | Alternativa MSI |
+| **macOS** | `GameStringer_1.15.0_x64.dmg` | Mac Intel |
+| **macOS** | `GameStringer_1.15.0_aarch64.dmg` | Apple Silicon |
+| **Linux** | `GameStringer_1.15.0_amd64.AppImage` | Universal (recomendado) |
+| **Linux** | `GameStringer_1.15.0_amd64.deb` | Debian / Ubuntu |
+| **Linux** | `GameStringer-1.15.0-1.x86_64.rpm` | Fedora / RHEL |
+
+**Requisitos:** Windows 10+, macOS 10.15+ ou Linux (Ubuntu 22.04+, Fedora 38+). 4 GB de RAM (8 GB+ para IA local), 500 MB de disco. As atualizações são **assinadas criptograficamente** e entregues via Tauri Updater (o app verifica cada atualização contra uma chave pública embutida).
+
+> 🛡️ **Aviso do antivírus ou do SmartScreen?** É um conhecido **falso positivo** — a tradução em tempo de execução usa injeção de DLL (BepInEx / gs-hook), uma técnica da qual os scanners heurísticos desconfiam, e cada nova versão começa com zero reputação no SmartScreen. **[Leia docs/ANTIVIRUS.md](docs/ANTIVIRUS.md)** para saber o que a dispara, como verificar o seu download e como reportar o falso positivo.
+
+---
+
+## 🚀 Como funciona
+
+1. **Instale** o GameStringer e inicie
+2. **Sua biblioteca de jogos carrega automaticamente** — Steam, Epic, GOG, Origin, Ubisoft, Amazon, itch.io, Humble App, Game Jolt, Big Fish (seus jogos instalados são detectados em segundos, sem limite de número)
+3. **Escolha um jogo** → opcionalmente execute o **P.T. (Prediction Tool)** para ver dificuldade, tempo estimado, melhor cadeia LLM
+4. Clique em **"String it!"** — o GameStringer escaneia, extrai, traduz e aplica o patch automaticamente
+5. **Jogue no seu idioma** — backups são sempre criados antes de aplicar o patch
+
+É só isso. Sem linha de comando, sem edição manual de arquivos, sem experiência em modding.
+
+### O pipeline num relance
+
+```mermaid
+flowchart LR
+    A["📚 Escaneia<br/>biblioteca e arquivos"] --> B["🧠 P.T.<br/>analisa primeiro"]
+    B --> C["🎯 Detecta<br/>motor"]
+    C --> D["📤 Extrai<br/>strings"]
+    D --> E["🤖 Traduz<br/>IA + TM + glossário"]
+    E --> F["✅ QA<br/>pontuação 0–100"]
+    F --> G["🩹 Patch<br/>backup automático"]
+    G --> H["🎮 Joga<br/>no seu idioma"]
+
+    classDef core fill:#6d28d9,stroke:#8b5cf6,color:#fff
+    classDef trans fill:#1d4ed8,stroke:#3b82f6,color:#fff
+    classDef patch fill:#047857,stroke:#10b981,color:#fff
+    classDef res fill:#c2410c,stroke:#f97316,color:#fff
+    class A,H res
+    class B,C core
+    class D,E,F trans
+    class G patch
+```
+
+---
+
+## 🧠 O Prediction Tool (P.T.)
+
+> **O recurso mais poderoso do GameStringer.** Não comece uma tradução às cegas — analise primeiro.
+
+P.T. é um motor de análise profunda que roda *antes* de qualquer tradução. Ele escaneia a pasta do jogo, detecta o motor, estima o volume de texto traduzível e diz:
+
+- **Difficulty Score 0–100** — peso combinado de volume de strings, complexidade do motor, DRM, codificação, desafios linguísticos
+- **Tempo estimado** em **18 modelos LLM** — Ollama (Gemma 4, Qwen 3, Llama), OpenAI GPT-4/4o, Claude 3.5, Gemini, DeepL, DeepSeek, Groq
+- **5 cadeias LLM recomendadas**: Local (privacidade), Cloud (qualidade), Hybrid (equilibrada), Budget, Premium — cada uma com pontuação de custo e qualidade
+- **Detecção de DRM**: Denuvo, VMProtect, Steam DRM, EAC, BattlEye — avisa antes de tentar
+- **Análise de codificação**: Shift-JIS, UTF-8, UTF-16, Big5, EUC-KR detectados por arquivo
+- **Complexidade de tradução**: honoríficos, concordância de gênero, RTL, ruby/furigana, tratamento específico de CJK
+- **Pontuação de confiança** e **plano de workflow** — os passos exatos que serão executados ao clicar em "String it!"
+- **Exportar relatório** (JSON + Markdown) para compartilhar ou arquivar
+
+### P.T.Rank — Ranking Rápido
+
+Após executar o P.T. em vários jogos, abra o **P.T.Rank** para ver todos os títulos analisados ordenados por dificuldade. Perfeito para planejar sua fila de tradução: comece pelos fáceis, deixe os RPGs de centenas de milhares de strings para o final.
+
+### Dry Run Scanner
+
+Não quer analisar um jogo de cada vez? Execute **Dry Run** na página da Biblioteca para escanear **toda a sua biblioteca instalada em lote**, sem limite de jogos,, com **zero modificação de arquivos**. Você recebe um relatório JSON que categoriza cada jogo como **Ready** (motor suportado + strings extraíveis), **Errors** (problemas de manifest / bloqueio de DRM) ou **Unsupported** (motor desconhecido / sem texto). O progresso é em tempo real e nenhum backup é necessário porque nada é tocado.
+
+### String it! Smart Gate
+
+O botão **"String it!"** na página de detalhes do jogo é inteligente: se o jogo já foi analisado pelo P.T. nas últimas 24h, ele inicia o wizard de tradução diretamente. Caso contrário, sugere executar o P.T. primeiro (com escolha de um clique "Run P.T. first" / "String it! anyway"). Chega de execuções desperdiçadas em jogos que acabam sendo bloqueados por DRM ou questão de 5 minutos.
+
+```mermaid
+flowchart LR
+    CLICK["🖱️ Clique em String it!"] --> GATE{"P.T. executado<br/>nas últimas 24h?"}
+    GATE -- "Sim" --> WIZ["🚀 O wizard de tradução<br/>inicia diretamente"]
+    GATE -- "Não" --> CHOICE{"Sua escolha"}
+    CHOICE -- "Executar P.T. primeiro" --> PT["🧠 Análise P.T.<br/>dificuldade · DRM · tempo"] --> WIZ
+    CHOICE -- "String it! mesmo assim" --> WIZ
+
+    classDef core fill:#6d28d9,stroke:#8b5cf6,color:#fff
+    classDef gate fill:#334155,stroke:#94a3b8,color:#fff
+    classDef go fill:#047857,stroke:#10b981,color:#fff
+    class CLICK,PT core
+    class GATE,CHOICE gate
+    class WIZ go
+```
+
+---
+
+## 🎯 Motores de jogo suportados
+
+Uma detecção de motor, **três caminhos de tradução** — o GameStringer escolhe automaticamente o melhor:
+
+```mermaid
+flowchart TD
+    DET["🎯 Detecção de motor"] --> R1["🗂️ Patcher baseado em arquivos<br/>faz parsing e patch dos arquivos do jogo<br/><i>Unreal, Godot, RPG Maker MV/MZ, Ren'Py,<br/>Bethesda, CRI, Telltale, Visionaire…</i>"]
+    DET --> R2["💉 Injeção em runtime<br/>BepInEx · gs-hook DLL (Windows)<br/><i>Unity, jogos com texto hardcoded</i>"]
+    DET --> R3["👁️ OCR na tela<br/>tradução em overlay ao vivo<br/><i>RPG Maker clássico 2000/2003, jogos retrô</i>"]
+    R1 --> PLAY["🎮 Jogar traduzido"]
+    R2 --> PLAY
+    R3 --> PLAY
+
+    classDef core fill:#6d28d9,stroke:#8b5cf6,color:#fff
+    classDef patch fill:#047857,stroke:#10b981,color:#fff
+    classDef inj fill:#1d4ed8,stroke:#3b82f6,color:#fff
+    classDef ocr fill:#c2410c,stroke:#f97316,color:#fff
+    class DET core
+    class R1 patch
+    class R2 inj
+    class R3 ocr
+    class PLAY core
+```
+
+O GameStringer tem **12 motores com parser dedicado** e reconhece **mais de 20** no total, com diferentes níveis de profundidade:
+
+| Motor | Suporte | Como funciona |
+|--------|---------|--------------|
+| **Unity** | ✅ Completo | Instala automaticamente BepInEx + XUnity.AutoTranslator + pipeline Unity Localization Package (StringTable, SharedTableData, Addressables, Smart Strings) |
+| **Unreal Engine** | ✅ Completo | Extração e patch de `.locres` com UnrealLocres |
+| **Unreal _P.pak** | ✅ Completo | Empacotamento de mod como `<GameStringer>_P.pak` carregado via pasta Paks |
+| **Godot** | ✅ Completo | Suporte nativo a arquivos `.translation` |
+| **RPG Maker** | ✅ Completo | MV/MZ JSON, VX/Ace via Trans, XP via RMXP |
+| **Ren'Py** | ✅ Completo | Parsing nativo de scripts `.rpy` com detecção de diálogos |
+| **GameMaker** | ⚡ Parcial | Via integração UndertaleModTool |
+| **Telltale** | ✅ Completo | Suporte `.langdb` / `.dlog` |
+| **Wolf RPG** | ✅ Completo | Integração WolfTrans |
+| **Kirikiri** | ✅ Completo | Parsing `.ks` / `.scn` |
+| **TyranoScript** | ✅ Completo | Extrator fast-path com patch JSON |
+| **Electron** | ✅ Completo | Desempacotamento ASAR + detecção de JSON i18n |
+| **Bethesda (Skyrim/Fallout/Oblivion/Starfield)** | ✅ **NEW v1.9.0** | Parser BSA v103-105 + BA2 GNRL/DX10 + ESP/ESM (FULL/DESC/NAM1), STRINGS/DLSTRINGS/ILSTRINGS |
+| **CRI Middleware (Persona/Yakuza/Tales of/Dragon Ball)** | ✅ **NEW v1.9.0** | CPK + CRILAYLA + MSG/BMD/FTD com autodetecção de Shift-JIS/UTF-8/UTF-16 |
+| **Visionaire Studio** | ✅ Completo | Aventuras Daedalic (Deponia, Edna, etc.) |
+| **Danganronpa WAD** | ✅ Completo | Parser de arquivo WAD + patch de diálogos STX |
+
+> **Jogos Unity** recebem tratamento especial: se nenhum arquivo traduzível for encontrado, o GameStringer detecta que é um jogo Unity e oferece **instalar automaticamente BepInEx + XUnity.AutoTranslator** com um clique. Basta iniciar o jogo uma vez após a instalação, depois escanear novamente — todo o texto se torna traduzível.
+>
+> ⚠️ **Aviso Anti-Cheat**: BepInEx (injeção de DLL) pode acionar sistemas anti-cheat (EAC, BattlEye, Vanguard). O GameStringer inclui detecção anti-cheat e irá avisá-lo. **Use apenas em jogos single-player / offline.** O P.T. detecta DRM antes de qualquer modificação.
+
+---
+
+## ✨ Recursos
+
+### 🆕 Novidades na v1.15.0 — parâmetros do Ollama e Projetos ↔ Patch Hub
+
+- **🎚 Painel de parâmetros de inferência do Ollama** — ajuste as traduções com Ollama local usando os presets **Fiel / Equilibrado / Criativo**, ou mude para o **modo especialista** para controlar diretamente temperature, top-p e os demais ajustes de amostragem; a escolha é integrada de forma não invasiva em cada chamada de tradução do Ollama
+- **🔗 Integração Projetos ↔ Patch Hub** — **importe um `.gspack` como projeto concluído**, publique no Hub **pré-preenchido a partir de um projeto**, alterne o botão **Explorar / Meus patches** e **Aplicar ao jogo** com um clique (com backup automático)
+- **💬 Widget de feedback no app** — envie feedback ou relate um problema sem sair do aplicativo
+- **⚡ Patch Hub mais rápido** — **cache + limitação de taxa** das respostas para navegação e downloads mais ágeis sob carga
+- **🐛 Correções** — a webview de notícias RSS não é mais bloqueada pelo CORS, além de uma nova passagem de **auditoria de acessibilidade WCAG 2.1 AA**
+
+### 🆕 Novidades na v1.14.0 — compatibilidade comunitária e packs à prova de balas
+
+- **🧭 Telemetria de compatibilidade (opt-in)** — o "ProtonDB das traduções": relate se uma tradução funcionou e veja **selos de compatibilidade nos cards dos jogos**, apoiados por relatos da comunidade com proteções antiabuso e uma [página de estatísticas pública](https://gamestringer.ai/compatibilita.html)
+- **🔤 Detecção de glifos faltantes + correção automática de fonte** — o GameStringer analisa o mapa de caracteres da fonte do jogo, detecta quando os glifos do seu idioma estão faltando e **instala automaticamente uma fonte Noto compatível** para os motores baseados em arquivos (Ren'Py, RPG Maker) — chega de quadradinhos tofu no lugar do texto
+- **🛡 Integridade de packs verificável** — os packs da comunidade são verificados com um **SHA-256 agregado**, proteção contra path-traversal e marcação automática de packs adulterados
+- **💥 Reporte de crashes opt-in** — relatos anônimos com assinaturas de crashes recorrentes para que sejam corrigidos mais rápido
+- **📚 Scan robusto de idiomas da biblioteca** — detecção mais confiável dos idiomas que um jogo já inclui, além de um botão manual "Detectar idiomas"
+- **💬 Discord no ar** — entre em [discord.gg/SjnD3Z7Uf8](https://discord.gg/SjnD3Z7Uf8)
+- **🧪 Suíte de regressão de parsers** — fixtures binárias compartilhadas (Godot, .locres, STX, RPG Maker, CRI CPK, Bethesda) exercitadas tanto pelos parsers de Rust quanto de TS; 2 bugs reais encontrados e corrigidos
+- **📰 Feed de notícias mais limpo** — ruído de diffs do MediaWiki removido, posts de ofertas filtrados
+
+### 🆕 Novidades na v1.13.0
+
+- **🖥 Tradutor UE em tempo real marcado como experimental** — a ferramenta em tempo real do Unreal agora declara antecipadamente seu status experimental e verifica se o jogo está realmente em execução antes de começar
+- **🎛 Controles de qualidade nas Configurações** — interruptores para os novos recursos de qualidade de tradução (reflection pass, recuperação semântica) além de uma allowlist de provedores ampliada
+- **🌐 Site + i18n** — seção v1.12.0 no site com infográficos e uma nota do desenvolvedor, em 12 idiomas; chaves `aiQuality` / `semantic` / `lore` reincorporadas em todos os locales
+- **🐛 Correções** — o CI agora compila a release a partir do branch atual em vez de uma tag ainda não criada; políticas INSERT do fórum do Supabase recriadas sob endurecimento de RLS, com saída controlada do bridge; migração `20260626` deduplicada
+
+### 🆕 Novidades na v1.12.0 — traduções mais inteligentes e autoverificadas
+
+- **👁️ Tradução com contexto visual (VLM)** — para a tradução ao vivo / na tela, um modelo de visão de IA agora *vê o quadro* e traduz com esse contexto, deixando de adivinhar em palavras ambíguas (*"Chest"* é um baú ou uma parte do corpo?). Funciona com um modelo **local** (Ollama) ou **OpenAI / Gemini**. As capturas são recortadas e redimensionadas de forma nativa para ganho de velocidade.
+- **🪞 Traduções autocorretivas (Reflection)** — após traduzir, o GameStringer pode rodar uma rápida segunda passagem que revisa o próprio trabalho contra o seu **glossário, tom e formatação** e corrige apenas as linhas que realmente precisam. Seletivo por padrão, então continua rápido e barato.
+- **🧠 Memória semântica (RAG)** — sua Translation Memory e o glossário agora são combinados por **significado**, não apenas por palavras exatas, então uma frase que você já traduziu é reutilizada mesmo quando escrita de outra forma — mantendo a terminologia consistente em todo o jogo. Totalmente local (embeddings do Ollama); recorre à correspondência por palavras-chave se não estiver disponível.
+- **⚡ Tradução ao vivo mais fluida** — pipeline do overlay ao vivo reformulado e manipulação nativa de imagens para um resultado na tela mais rápido e limpo.
+- **🔌 Mais provedores prontos para uso** — allowlist ampliada para que mais backends funcionem de imediato: DeepL, Groq, Cerebras, Cohere, Together, Fireworks, Hugging Face, Azure Translator, DashScope, LibreTranslate, Lingva, MyMemory.
+
+### 🆕 Novidades na v1.11.2
+
+- **Mais lojas** — detecção de instalações locais para **Humble App, Game Jolt e Big Fish Games**, além dos launchers existentes
+- **Busca de traduções** — verifique se um jogo já inclui o seu idioma via **PCGamingWiki**, além de rápidos **links de busca de fan-patches italianos** a partir da visão do jogo
+- **Publicar no Patch Hub** — envie um projeto concluído ao **Patch Hub** da comunidade em um passo (`app/projects` → publish, reutiliza `publishPack`)
+- **Visão geral do Community Hub** — novo painel inicial com atividade recente, últimos packs e categorias
+- **Notícias de tradução italiana** — adicionados feeds RSS curados de fan-translation (Ctrl+Trad, OldGamesItalia, Romhacking.it, Language Pack Italia, Q-Gin, …)
+- **String it! em todo lugar** — roteamento de um clique para Unity/Unreal/Godot + um pipeline cloud para **TyranoScript**
+- **Unity** — bridge **Ollama** local para XUnity (CustomTranslate); os downloads de BepInEx/XUnity/TMP/UABEA são resolvidos pela GitHub API
+- **Godot** — parser `.pck` reescrito que lê arquivos reais de **Godot 4.4+** (verificado em *Slay the Spire 2*)
+- **Confiabilidade no desktop** — removidas as últimas chamadas web `/api`: o editor usa a TM local, e as chamadas translate/export/voice/store passam pelo backend nativo
+
+### 🆕 Novidades na v1.10.2
+
+- **Correção do auto-atualizador** — resolvido um estado travado em "Preparando…" no qual a atualização nunca começava a baixar. Um objeto de update do React desatualizado era passado para `downloadAndInstall` e o flag `updating` nunca era resetado; agora o auto-update inicia, baixa e instala de forma confiável (`components/notifications/auto-updater.tsx`, `hooks/use-tauri-updater.ts`)
+- **Persistência confiável de configurações** — as configurações do app e as API keys dos provedores de IA agora são salvas de forma confiável no disco (`data_dir/GameStringer/settings.json`) via os comandos Tauri `save_app_settings` / `load_app_settings`; antes algumas configurações não eram persistidas
+- **Adicionar jogos manualmente do disco** — agora você pode adicionar um jogo escolhendo a pasta dele no disco, sem depender apenas da autodetecção da biblioteca (Steam/Epic/etc.) (`lib/manual-games.ts`, `app/library/page.tsx`)
+
+### 🆕 Novidades na v1.9.1
+
+- **Correção da CSP que bloqueava o Supabase** — o Community Chat era silenciosamente bloqueado pela rígida Content Security Policy do Tauri v2. Adicionados `https://*.supabase.co` e `wss://*.supabase.co` a `connect-src`
+- **Correção da autoconexão do chat** — auth coordenada entre `main-layout` e `persistent-chat` via eventos personalizados, eliminando condições de corrida
+- **Correção de erro de timeout** — uma stale closure no max-timeout causava um falso "Tempo de carregamento muito longo" mesmo quando o chat carregava corretamente
+- **Builds de macOS** — DMG (Intel) e `.app.tar.gz` (Apple Silicon) agora disponíveis
+
+### 🆕 Novidades na v1.9.0
+
+- **Presença online unificada** — Supabase Realtime + fallback de DB, auto-away/auto-online, heartbeat a cada 30s
+- **Notificações do System Tray** — notificações nativas do SO para chat, traduções, erros, atualizações, jogos, amigos, notícias com horas silenciosas configuráveis
+- **Error Boundaries + recuperação de crash** — WidgetErrorBoundary (auto-retry 5s, máx 3), AppErrorBoundary com recarregamento
+- **Resiliência de rede / modo offline** — monitor de rede, barra de status (vermelho/âmbar/verde), retry com backoff exponencial, fila offline
+- **Character Voice Profiles (Voice Cloning)** — extração automática do estilo do personagem a partir dos diálogos, 16 tons, prompt injection para traduções consistentes
+- **Infraestrutura de Fine-Tuning** — datasets a partir de correções humanas (Adaptive MT), 4 formatos de exportação, gerenciamento de modelos por jogo com Ollama
+- **Code Splitting / Lazy Loading** — 8 componentes pesados convertidos para React.lazy + Suspense para um início mais rápido
+- **Correções de bugs** — dupla init do NetworkResilience + vazamento de listener, Supabase 400 em user_profiles, strings de versão do tray, bypass de horas silenciosas para notificações críticas
+
+### 🤖 Tradução por IA
+
+- **20+ provedores**: OpenAI, Claude, Gemini, DeepSeek, Mistral, Groq, DeepL, Ollama (local), LM Studio, TranslateGemma, HY-MT, Qwen 3, NLLB-200, Cerebras, Together AI, Fireworks, OpenRouter, Cohere, Lingva, MyMemory
+- **Context-aware**: entende o gênero do jogo, a voz do personagem, o tom, narrativa vs UI vs diálogo
+- **Translation Memory e Glossário**: consistência em todo o projeto com extração automática de glossário
+- **Auto-Select Engine** (NEW v1.7.0): preset `auto` que classifica dinamicamente os provedores por idioma de destino + gênero do jogo (DeepL para europeus, Claude para CJK, boost baseado no gênero)
+- **Multi-LLM Compare**: executa múltiplos provedores em paralelo, escolha o melhor resultado por string
+- **Quality gates**: pontuação QA automática em cada string traduzida (0-100) com ContentTypeBadge
+- **Vision LLM Translator**: usa capturas de tela in-game para contexto (Ollama, Gemini, GPT-4o)
+- **Live Quality Preview**: veja pontuações de qualidade em tempo real durante a tradução em lote
+- **Suporte RTL**: detecção automática de direção e manipulação do atributo `dir`
+
+### 🧠 P.T. — Prediction Tool (v1.9.0)
+
+- **Difficulty Score 0-100** com fatores ponderados (volume, motor, DRM, codificação, complexidade)
+- **Estimativas de tempo para 18 modelos LLM** incluindo Gemma 4 (27B MoE A4B / E4B / E2B)
+- **5 cadeias LLM** (Local / Cloud / Hybrid / Budget / Premium) com estimativas de custo e qualidade
+- **Detecção DRM / Anti-Cheat** (Denuvo, VMProtect, Steam DRM, EAC, BattlEye, Vanguard)
+- **Análise de codificação** por arquivo (Shift-JIS, UTF-8/16, Big5, EUC-KR)
+- **Análise de complexidade de tradução** (honoríficos, gênero, CJK, ruby, RTL)
+- **P.T.Rank / Quick Ranking** — ordena todos os jogos analisados por dificuldade
+- **Dry Run Scanner** — scan em lote de toda a sua biblioteca instalada, sem limite de jogos, sem modificação
+- **Workflow Orchestrator** — motor de execução real com fast path universal para 6+ motores e progresso em tempo real
+- **Cache de predição** (24h) — reabertura instantânea de jogos já analisados
+- **Exportar relatório** (JSON + Markdown) para compartilhar e arquivar
+
+### 📚 Biblioteca de Jogos
+
+- **Auto-detect**: Steam (com Family Sharing), Epic, GOG Galaxy, Origin/EA, Ubisoft Connect, Amazon Games, itch.io, Humble App, Game Jolt, Big Fish Games
+- **Toda a sua biblioteca instalada** reconhecida em segundos, sem limite de jogos
+- **Cards de jogos** com capas, metadados, badge do motor, badge VR, status de instalação
+- **Ações rápidas ao passar o mouse**: String it!, Batch, Community, P.T. — todas com um clique
+- **Game Update Tracker**: detecta quando a Steam atualiza um jogo traduzido (via `buildid`), verifica a integridade do patch (arquivos BepInEx, presença de `_P.pak`), avisa se é necessário reaplicar o patch
+- Botão **"Stop monitoring"** para parar de monitorar um jogo específico
+
+### 🔧 Ferramentas de Tradução
+
+- **One-Click Translate** ("String it!"): escanear → traduzir → aplicar patch em um único fluxo
+- **Batch Translation**: traduza jogos ou pastas inteiras de uma vez
+- **Tradutor de Legendas**: SRT, VTT, ASS/SSA com preservação do timing
+- **OCR Translator**: extrai texto de jogos retrô (presets 8-bit, 16-bit, DOS) com backend real Tauri Tesseract
+- **Voice Pipeline**: speech-to-text → traduzir → text-to-speech com **Duration Matching** (NEW v1.7.0) — ajusta automaticamente a velocidade para corresponder à duração do áudio original
+- **Lip Sync** (NEW v1.7.0): integração Rhubarb para geração de visemas (A-X), timeline interativa, exportação para Unity (blend shapes) e Unreal (FaceFX)
+- **Gridly CSV Export/Import** (NEW v1.7.0): formato de colunas multi-idioma compatível com Gridly, Lokalise e Crowdin
+- **Overlay em tempo real**: veja as traduções enquanto joga via VR/screen overlay
+- **Auto-Translate Review**: botão "Translate all untranslated" com barra de progresso
+- **Lore Assistant**: chat RAG que conhece o lore e os diálogos do jogo
+- **Character Voice Profiles**: defina personalidade, tom, padrões de fala por personagem
+- **Translation Confidence Heatmap**: visão geral visual da qualidade de todas as traduções
+
+### 🎮 Patchers de Motores de Jogo
+
+- **Unity**: auto-instalador BepInEx + XUnity.AutoTranslator, Unity Localization Package (StringTable, SharedTableData, catálogo Addressables, validador Smart Strings)
+- **Unreal Engine**: extração `.locres` + empacotamento de mod `_P.pak`
+- **Bethesda Engine Patcher** (NEW v1.9.0): Skyrim LE/SE/AE, Fallout 3/NV/4, Oblivion, Starfield — BSA v103-105 + BA2 GNRL/DX10 + ESP/ESM (FULL/DESC/NAM1)
+- **CRI Middleware Patcher** (NEW v1.9.0): Persona 5 Royal, Yakuza, Tales of, Dragon Ball — CPK + CRILAYLA + MSG/BMD/FTD
+- **Ren'Py**, **RPG Maker**, **Godot**, **GameMaker**, **Kirikiri**, **Wolf RPG**, **Telltale**, **Visionaire**, **Danganronpa WAD** — todos com parsers nativos
+- **Wizard Stepper**: UI multi-step compartilhada para todos os patchers
+- **Universal PO Export** (gettext `.po`) para cada patcher com metadados de projeto/idioma/fonte/motor
+- **Backup automático**: antes de cada patch, com restauração em um clique
+
+### 🔌 Avançado
+
+- **Auto-Hook Scanner**: escaneamento de memória de processo (Windows WinAPI) para strings hardcoded
+- **System Monitor**: uso VRAM/RAM em tempo real para planejamento de LLM local
+- **Ollama Setup Wizard**: instalação passo a passo de IA local
+- **Ollama Manager**: auto-discovery de modelos do registro ollama.com + auto-refresh em foco/navegação
+- **Debug Console**: console integrado com log intercept
+- **Video Extractor** (v1.7.0): extraia e converta vídeo FMV de jogos retrô/modernos (VMD, BIK, SMK, USM, ROQ) com upscaling por IA (Real-ESRGAN), link direto da página de detalhes do jogo
+- **Plugin System**: doc de design para plugins de terceiros (veja `docs/PLUGIN_SYSTEM.md`)
+- **Community Hub**: compartilhe e baixe translation memories + integração com GitHub Discussions
+- **Public API v1**: endpoints REST para integração (`/api/v1/translate`, `/api/v1/batch`)
+
+### 💬 Community Chat
+
+- **Chat em tempo real** com outros tradutores via Supabase Realtime
+- **4 salas padrão**: General, Translations, Feedback & Bugs, Announcements
+- **Salas personalizadas**: crie salas para jogos ou projetos específicos
+- **Auto-Bridge Auth**: seu perfil do GameStringer sincroniza automaticamente com o Supabase — sem login extra
+- **Presença online**: veja quem está online em cada sala
+- **Responder / editar / excluir** mensagens com ownership aplicada via RLS
+- **Widget drawer expansível** no canto inferior direito
+
+### ♿ Acessibilidade (v1.9.0)
+
+- **WCAG 2.1 AA sweep** — `aria-label` em botões de ícone, headings semânticos `CardTitle`, `focus-visible` em todas as primitivas, link skip-to-content, landmark `main`, helpers `sr-only` em italiano
+- **`prefers-reduced-motion`** respeitado em todas as animações
+- **`forced-colors`** (Modo de Alto Contraste do Windows) respeitado
+- **UI em 12 idiomas**: IT, EN, ES, FR, DE, JA, ZH, KO, PT, RU, PL, EL (grego adicionado na v1.10.0)
+- **Suporte a layout RTL** com detecção automática de direção
+
+### 🎨 Design System (v1.9.0)
+
+- **Variantes de Card** via `cva`: default, muted, highlight, success, error, warning
+- **Tamanhos de Button** incluindo `xs` e `icon-sm`
+- **Utilitários de texto**: `text-micro` (9px), `text-2xs` (10px) — acabou o Tailwind arbitrário
+- **Radix UI unificado**: migrados 37 arquivos de `@radix-ui/react-*` para `radix-ui`, 27 pacotes removidos
+- **Bundle otimizado**: `optimizePackageImports` para radix-ui, framer-motion, recharts, cmdk
+
+### 🖥️ App
+
+- **Auto-atualizações assinadas**: atualização em um clique dentro do app via Tauri Updater
+- **Perfis**: múltiplos perfis de usuário com chaves de recuperação
+- **Global Hotkeys**: `Ctrl+Shift+T` OCR, `Ctrl+Shift+Q` Quick Translate, `Ctrl+Alt+O` Overlay, `Alt+T` toggle XUnity
+- **System Tray**: ações rápidas, status do Ollama ao vivo, submenu de ferramentas, notificações nativas do SO com preferências
+- **Cross-platform**: Windows, macOS e Linux com builds nativos
+- **Correção de tray Windows**: previne loop de flash de console no spawn de processos filhos
+
+---
+
+## 🔧 Provedores de IA
+
+| Provedor | API Key | Free Tier | Melhor para |
+|----------|---------|-----------|----------|
+| **Ollama** | Não (local) | ✅ Ilimitado | Privacidade, offline |
+| **LM Studio** | Não (local) | ✅ Ilimitado | Privacidade, modelos GGUF |
+| **TranslateGemma** | Não (Ollama) | ✅ Ilimitado — 55 idiomas, Google | **Início recomendado** |
+| **HY-MT1.5** | Não (Ollama) | ✅ Ilimitado — ~1GB RAM, Tencent | Máquinas com pouca RAM |
+| **Qwen 3** | Não (Ollama) | ✅ Ilimitado — multilíngue | Idiomas CJK |
+| **Gemma 4** | Não (Ollama) | ✅ Ilimitado — 27B MoE A4B/E4B/E2B | Qualidade local |
+| **Gemini** | Sim | ✅ Free tier (15 RPM) | **Cloud recomendada** |
+| **DeepSeek** | Sim | ✅ $0.14/1M input | Cloud barata |
+| **Groq** | Sim | ✅ 14.400 req/dia | Velocidade |
+| **Mistral** | Sim | ✅ Free tier | Cloud da UE |
+| **OpenAI** | Sim | Pago | Qualidade GPT-4o |
+| **Claude** | Sim | Pago | Nuance, contexto longo |
+| **DeepL** | Sim | ✅ 500k caracteres/mês | Idiomas europeus |
+| **MyMemory** | Não | ✅ Ilimitado | Fallback |
+| **Lingva** | Não | ✅ Ilimitado | Mirror do Google MT |
+| **Cerebras** | Sim | ✅ Free tier | Velocidade |
+| **Together AI** | Sim | ✅ $25 de crédito grátis | Modelos abertos |
+| **Fireworks** | Sim | ✅ Free tier | Modelos abertos |
+| **OpenRouter** | Sim | ✅ Modelos grátis | Variedade de modelos |
+| **NLLB-200** | Sim | ✅ 200 idiomas | Idiomas raros |
+| **Cohere** | Sim | ✅ Teste grátis | RAG |
+
+**Recomendados para começar**: **TranslateGemma** via Ollama (grátis, local, 55 idiomas) ou **Gemini** (free tier, cloud). Pouca RAM: **HY-MT1.5** (~1GB). Melhor qualidade: **Claude 3.5** ou **GPT-4o**. Melhor CJK: **Qwen 3**.
+
+---
+
+## 📖 Documentação
+
+### Guias do Usuário (12 idiomas)
+
+| | | |
+|---|---|---|
+| 🇮🇹 [Italiano](docs/GUIDA_UTENTE.md) | 🇬🇧 [English](docs/USER_GUIDE_EN.md) | 🇪🇸 [Español](docs/USER_GUIDE_ES.md) |
+| 🇫🇷 [Français](docs/USER_GUIDE_FR.md) | 🇩🇪 [Deutsch](docs/USER_GUIDE_DE.md) | 🇯🇵 [日本語](docs/USER_GUIDE_JA.md) |
+| 🇨🇳 [中文](docs/USER_GUIDE_ZH.md) | 🇰🇷 [한국어](docs/USER_GUIDE_KO.md) | 🇧🇷 [Português](docs/USER_GUIDE_PT.md) |
+| 🇷🇺 [Русский](docs/USER_GUIDE_RU.md) | 🇵🇱 [Polski](docs/USER_GUIDE_PL.md) | 🇮🇷 [فارسی](docs/USER_GUIDE_FA.md) |
+
+### Documentação do Projeto
+
+- **[CHANGELOG.md](CHANGELOG.md)** — histórico completo de versões
+- **[ROADMAP.md](ROADMAP.md)** — roadmap priorizado (P0/P1/P2)
+- **[docs/VERSIONING.md](docs/VERSIONING.md)** — política de versionamento
+- **[docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md)** — status atual num relance
+- **[docs/ANTIVIRUS.md](docs/ANTIVIRUS.md)** — falsos positivos de antivírus / SmartScreen
+- **[PLUGIN_SYSTEM.md](docs/PLUGIN_SYSTEM.md)** — design da arquitetura de plugins
+- **[LICENSE](LICENSE)** — Source-Available License v1.1
+- **[docs/LEGAL.md](docs/LEGAL.md)** — posição legal e política de uso aceitável
+
+---
+
+## 🛠️ Compilar a partir do código-fonte
+
+**Pré-requisitos**: Node.js 18+, Rust 1.70+, npm. No Linux também: `libwebkit2gtk-4.1-dev`, `libayatana-appindicator3-dev`, `librsvg2-dev`.
+
+```bash
+git clone https://github.com/rouges78/GameStringer.git
+cd GameStringer
+npm install
+npm run dev          # desenvolvimento
+npm run tauri:build  # build de produção
+```
+
+Backend Rust: `cd src-tauri && cargo check` para verificar que os comandos Tauri compilam na sua plataforma.
+
+---
+
+## 💖 Apoio
+
+Se o GameStringer te ajudou a jogar no seu idioma:
+
+<p align="center">
+  <a href="https://buymeacoffee.com/gamestringer">
+    <img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-FFDD00?logo=buy-me-a-coffee&logoColor=black" alt="Buy Me a Coffee" />
+  </a>
+  <a href="https://ko-fi.com/gamestringer">
+    <img src="https://img.shields.io/badge/Ko--fi-FF5E5B?logo=ko-fi&logoColor=white" alt="Ko-fi" />
+  </a>
+  <a href="https://github.com/sponsors/rouges78">
+    <img src="https://img.shields.io/badge/GitHub%20Sponsors-EA4AAA?logo=github-sponsors&logoColor=white" alt="GitHub Sponsors" />
+  </a>
+</p>
+
+---
+
+## 📜 Licença
+
+**Source-Available License v1.1** — o código-fonte é público e você pode compilá-lo por conta própria, mas não é "Open Source" aprovado pela OSI.
+
+- ✅ Grátis para uso pessoal
+- ✅ Livre para inspecionar, compilar e modificar para si mesmo
+- ❌ Uso comercial requer permissão por escrito
+- ❌ Redistribuição de versões modificadas requer permissão por escrito
+
+Veja [LICENSE](LICENSE) para detalhes, e **[docs/LEGAL.md](docs/LEGAL.md)** para a posição legal do projeto e a política de uso aceitável. Dúvidas? Abra uma [Discussion](https://github.com/rouges78/GameStringer/discussions).
+
+---
+
+## 🙏 Credits
+
+- **[BepInEx](https://github.com/BepInEx/BepInEx)** — framework de modding Unity (BepInEx Team)
+- **[XUnity.AutoTranslator](https://github.com/bbepis/XUnity.AutoTranslator)** — framework de tradução Unity (bbepis)
+- **[UnrealLocres](https://github.com/akintos/UnrealLocres)** — parser `.locres` do Unreal (akintos)
+- **[UndertaleModTool](https://github.com/krzys-h/UndertaleModTool)** — modding GameMaker (krzys-h)
+- **[Tauri](https://tauri.app)** — framework de app desktop
+- **[Tesseract.js](https://github.com/naptha/tesseract.js)** — motor OCR
+- **[Ollama](https://ollama.com)** — runtime LLM local
+- **[Supabase](https://supabase.com)** — backend em tempo real para o Community Chat
+
+---
+
+<p align="center">
+  Feito com ❤️ para gamers que querem jogar no seu próprio idioma<br>
+  <strong>GameStringer v1.15.0</strong> · <a href="https://www.gamestringer.ai">gamestringer.ai</a> · © 2025-2026 GameStringer Team
+</p>

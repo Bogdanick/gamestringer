@@ -1,0 +1,197 @@
+'use client';
+
+import { useEffect, useState, ReactNode } from 'react';
+import { useProfiles } from '@/hooks/use-profiles';
+import { useProfileSettings } from '@/hooks/use-profile-settings';
+import { clientLogger } from '@/lib/client-logger';
+// Context e hook vivono in profile-auth-context.ts (15/08/2026): esportarli da
+// qui — un file che esporta anche un componente — spegneva il Fast Refresh
+// (doppio click su ogni pagina in dev). I file .ts importano da là, non da qui.
+import { ProfileAuthContext, type ProfileAuthContextType } from './profile-auth-context';
+import type { UserProfile } from '@/types/profiles';
+
+interface ProfileAuthProviderProps {
+  children: ReactNode;
+}
+
+export function ProfileAuthProvider({ children }: ProfileAuthProviderProps) {
+  const { currentProfile, isLoading, logout: profileLogout, refreshProfiles } = useProfiles();
+  
+  // Force re-render when currentProfile changes
+  const [_renderKey, setRenderKey] = useState(0);
+  useEffect(() => {
+    setRenderKey(prev => prev + 1);
+  }, [currentProfile]);
+
+  // ⛔ CABLAGGIO 13/08/2026 — senza questo, le notifiche di sistema NON arrivano
+  // a nessuno, in silenzio. Lato Rust `SystemEventHandler` recapita iterando su
+  // `active_profiles`, una lista che nasce VUOTA e che non veniva popolata da
+  // nessuno: il `for` non eseguiva mai e la funzione restituiva comunque
+  // successo ([fallimenti-muti]). Qui registriamo il profilo autenticato appena
+  // esiste, perché questo è l'unico punto dell'app che sa QUALE profilo è.
+  useEffect(() => {
+    if (!currentProfile?.id) return;
+    let annullato = false;
+    (async () => {
+      try {
+        const { invoke } = await import('@/lib/tauri-api');
+        if (annullato) return;
+        await invoke('add_system_active_profile', { profileId: currentProfile.id });
+        clientLogger.debug(`🔔 Profilo ${currentProfile.id} registrato per le notifiche di sistema.`);
+      } catch (err) {
+        // Non blocca il login: senza registrazione si perdono le notifiche di
+        // sistema, non l'accesso. Ma va LOGGATO — se resta muto qui, il sintomo
+        // che si vede è "le notifiche non arrivano" senza nessuna traccia.
+        clientLogger.warn('Registrazione profilo per notifiche di sistema fallita:', String(err));
+      }
+    })();
+    return () => { annullato = true; };
+  }, [currentProfile?.id]);
+
+  // Listen to auth changes from other hook instances and refresh local state
+  useEffect(() => {
+    const handler = () => {
+      clientLogger.debug('🔔 ProfileAuthProvider: received profile-auth-changed -> refreshing profiles');
+      refreshProfiles().catch(err => clientLogger.warn('ProfileAuthProvider refreshProfiles error:', err));
+    };
+    if (typeof window !== 'undefined') {
+      window.addEventListener('profile-auth-changed', handler);
+    }
+    return () => {
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('profile-auth-changed', handler);
+      }
+    };
+  }, [refreshProfiles]);
+  const { globalSettings: _globalSettings } = useProfileSettings();
+  const [sessionTimeRemaining, setSessionTimeRemaining] = useState<number | null>(null);
+  const [isSessionExpired, setIsSessionExpired] = useState(false);
+
+  // Check session status periodically - DISABILITATO per evitare conflitti con authentication semplice
+  // useEffect(() => {
+  //   if (!currentProfile) {
+  //     // Reset session state when no profile
+  //     setIsSessionExpired(false);
+  //     setSessionTimeRemaining(null);
+  //     return;
+  //   }
+
+  //   // Reset session expired for new profile
+  //   setIsSessionExpired(false);
+
+  //   const checkSession = async () => {
+  //     try {
+  //       // Check if session is expired via Tauri command (timeout: 30 minuti = 1800 secondi)
+  //       const { invoke } = await import('@/lib/tauri-api');
+  //       const response = await invoke<{success: boolean, data: boolean}>('is_session_expired', { 
+  //         timeout_seconds: 1800 
+  //       });
+        
+  //       if (response.success) {
+  //         setIsSessionExpired(response.data);
+
+  //         if (!response.data) {
+  //           // Get remaining session time
+  //           const timeResponse = await invoke<{success: boolean, data: number}>('get_session_time_remaining', {
+  //             timeout_seconds: 1800 // 30 minuti
+  //           });
+  //           if (timeResponse.success) {
+  //             setSessionTimeRemaining(timeResponse.data);
+  //           }
+  //         }
+  //       }
+  //     } catch (error: unknown) {
+  //       clientLogger.error('Error checking session status:', error);
+  //       // Non impostare expired=true per errori di connection
+  //       // setIsSessionExpired(true);
+  //     }
+  //   };
+
+  //   // Check immediately
+  //   checkSession();
+
+  //   // Check every 30 seconds
+  //   const interval = setInterval(checkSession, 30000);
+
+  //   return () => clearInterval(interval);
+  // }, [currentProfile]);
+
+  // Auto-logout when session expires - DISABILITATO per evitare conflitti
+  // useEffect(() => {
+  //   if (isSessionExpired && currentProfile) {
+  //     handleLogout();
+  //   }
+  // }, [isSessionExpired, currentProfile]);
+
+  const renewSession = async (): Promise<boolean> => {
+    try {
+      const { invoke } = await import('@/lib/tauri-api');
+      const response = await invoke<{success: boolean, data: boolean}>('renew_session');
+      
+      if (response.success && response.data) {
+        setIsSessionExpired(false);
+        // Refresh session time
+        const timeResponse = await invoke<{success: boolean, data: number}>('get_session_time_remaining', {
+          timeoutSeconds: 1800 // 30 minuti - Tauri 2.x converte automaticamente in snake_case
+        });
+        if (timeResponse.success) {
+          setSessionTimeRemaining(timeResponse.data);
+        }
+        return true;
+      }
+      
+      return false;
+    } catch (error: unknown) {
+      clientLogger.error('Error renewing session:', error);
+      return false;
+    }
+  };
+
+  const handleLogout = async () => {
+    try {
+      await profileLogout();
+      setSessionTimeRemaining(null);
+      setIsSessionExpired(false);
+    } catch (error: unknown) {
+      clientLogger.error('Error during logout:', error);
+    }
+  };
+
+  // Calcola stato authentication
+  // SEMPLIFICATO: Se c'è un currentProfile, l'utente è autenticato
+  const isAuthenticated = !!currentProfile;
+  
+  // Debug log rimosso per ridurre spam console
+
+  // Alert for authentication problems (keep for debugging critical issues)
+  if (currentProfile && !isAuthenticated) {
+    clientLogger.error('Authentication issue: currentProfile present but isAuthenticated = false', {
+      profileName: (currentProfile as UserProfile).name,
+      isSessionExpired,
+      sessionTimeRemaining
+    });
+  }
+
+  const value: ProfileAuthContextType = {
+    isAuthenticated,
+    currentProfile,
+    isLoading,
+    sessionTimeRemaining,
+    isSessionExpired,
+    renewSession,
+    logout: handleLogout,
+  };
+
+  return (
+    <ProfileAuthContext.Provider value={value}>
+      {children}
+    </ProfileAuthContext.Provider>
+  );
+}
+
+// Re-export per i componenti che già importano da qui; i file NON-React
+// (hooks/use-notifications.ts e simili) devono usare ./profile-auth-context.
+export { useProfileAuth } from './profile-auth-context';
+
+
+

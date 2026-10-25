@@ -1,0 +1,233 @@
+# 📋 TODO.md - GameStringer Development Tasks
+
+> Ultimo aggiornamento: 23 Giugno 2026 — v1.10.2
+
+---
+
+## 🎯 RELEASE v2.0 — IL FLUSSO HERO
+
+> **La promessa:** l'utente trascina la cartella di un gioco, preme **un pulsante**, e ottiene il gioco tradotto nella sua lingua. Tutto il resto della app (multi-LLM, glossario, voci, OCR, texture) sono *ingredienti* di questo piatto, non feature a sé.
+
+### ⭐ "Un pulsante. Traduci il gioco."
+
+**Principio di progetto — leggere prima di toccare codice:**
+"Un pulsante" è la promessa *all'utente*, non magia universale. Sotto, la app **riconosce il motore** del gioco e instrada all'estrattore/ripacker giusto. L'utente vede un click; noi supportiamo **un motore alla volta, reso perfetto su un set curato di giochi**. Niente lotteria runtime, niente "test su un milione di giochi": si testa la *pipeline* su 4-5 titoli per motore.
+
+**Esito audit (17/06/2026): la pipeline NON è da costruire — esiste già.** Router motore (`engine_detector.rs`, 48 motori), rilevamento, estrazione, generazione traduzione e il "pulsante" (`startAutoTranslate()` in `components/game-detail-client.tsx`) sono **tutti implementati**. Esistono 12 patcher file-based con test su fixture (vedi `docs/ENGINE-COVERAGE.md`). Il lavoro per la release **non è scrivere la pipeline, è collaudarla sul gioco reale e renderla impeccabile su UN motore.**
+
+**Motore scelto per primo: Ren'Py** (confermato 17/06). Pipeline completa: `detect_renpy_game` → `extract_all_renpy_strings` → `generate_renpy_translation` → `save/load_renpy_translations`, già instradata in `startAutoTranslate()` (righe ~489-503). Perché Ren'Py come hero:
+- **Output nativo, non invasivo**: `generate_renpy_translation` genera i blocchi `translate` nel sistema ufficiale di Ren'Py (cartella `tl/`) → niente ripacking di archivi, il gioco carica la traduzione nativamente.
+- **Più solido**: 82 test su fixture (vs 23 di RPG Maker) → meno rischio per arrivare a "perfetto".
+- **Pulito**: nessuna contaminazione OCR (RPG Maker classico dirotta su live OCR; Ren'Py no).
+- **Domanda alta**: enorme scena di fan-translation di visual novel (DDLC, Katawa Shoujo, VA-11 Hall-A…).
+
+- [x] **Audit di ciò che esiste già in casa** — *Fatto 17/06.* Pipeline Ren'Py completa in codice (detect → extract → generate → save). Gap reale = collaudo end-to-end + UX, non implementazione.
+- [ ] **Collaudo end-to-end su gioco reale** — Nessuno dei 12 patcher è mai stato provato su un gioco vero start-to-finish ("Testato" = solo fixture, vedi nota in ENGINE-COVERAGE.md). Prendere un gioco Ren'Py reale, passarlo dal pulsante alla cartella `tl/` tradotta, verificare il risultato in gioco. Qui escono i bug veri (encoding, font CJK, stringhe interpolate, tag testo).
+- [x] **Verifica aggancio glossario / multi-LLM / voci personaggio** — *Verificato 23/06.* (1) **Glossario auto: sì** — `runRenpyTranslation` → `load_smart_glossary` (tier locked>synced, cap 80) → iniettato in `build_context_prompt` ("Apply this glossary exactly"). (2) **Voci personaggio: agganciate** — prima passava solo il nome del parlante; ora `runRenpyTranslation` carica i Character Voice Profile (`lib/voice/voice-profiles.ts`) per `gameId`, li auto-estrae dai dialoghi se assenti, e inietta un descrittore ricco (tono, registro, personalità, speech pattern, catchphrase) per parlante nel prompt. (3) **Multi-LLM: no** — path single-model offline Ollama (`offline_translate_batch_context`, modello `gs_renpy_model` o default `gemma4:e4b`); il multi-LLM/compare resta fuori dal path auto (eventuale lavoro futuro). Non è "riga per riga": chunk da 30, validazione codici `{..}`/`[..]`, checkpoint/resume.
+- [x] **UX "un pulsante" rifinita** — *Fatto 23/06.* Stato unificato `autoTranslateBusy` (spinner + disabilita + guard anti-doppio-click su TUTTI i motori, non più solo generico). Ren'Py instradato nel **pannello stepper** (`AutoTranslateStepper`) con step/stato, **progress inline** `Traduzione N/M` sul pulsante, e **risultato** (% successo, durata, X/Y, glossario, voci). Aggiunto **messaggio onesto** nel path generico quando il motore non è supportato / 0 stringhe estraibili (niente falso successo). Verificato tsc + eslint (0 errori).
+- [ ] **QA su set curato** — 4-5 giochi Ren'Py reali tradotti end-to-end e verificati. Questo è il criterio di "hero pronto". *(Strumenti pronti 23/06: checklist `docs/RENPY_COLLAUDO_CHECKLIST.md` aggiornata + script oggettivo `scripts/validate-renpy-tl.js` che dà PASS/FAIL su `tl/`. Resta l'esecuzione manuale sui giochi reali — richiede app+Ollama+giochi.)*
+
+### 🚦 Gate di release (bloccanti)
+
+- [ ] **3 gate CI verdi** — `tsc` (type-check) + ESLint + test devono passare.
+- [ ] **Suite test 466 verde / 0 rossa** — Nessuna regressione.
+- [ ] **Definizione di "fatto" per l'hero** — L'hero è pronto quando i 4-5 titoli del set curato passano end-to-end senza intervento manuale.
+
+---
+
+## 🌍 Localizzazione UI (11 lingue)
+
+> Stato 23/06/2026 — copertura quasi piena su tutte le lingue. Guardia anti-regressione: `__tests__/lib/i18n-locale-integrity.test.ts` (chiavi allineate a `it.json`, zero leftover oltre baseline). Sorgenti: `lib/i18n/locales/<lang>.json` (~4.414 stringhe per lingua).
+
+Stato per lingua:
+
+- [x] **it** — lingua sorgente (100%)
+- [x] **en** — 100%
+- [x] **ru** — completata (issue #47, chiusa): ~97% cirillico, 0 residui italiani
+- [x] **es / fr / de / pt / pl** — completate (EN→lingua, ~3.800 stringhe). Residui in baseline = cognati corretti identici all'italiano (es. "Sistema", "Data", "Tipo", "Tema", "Formato", "Temperatura", "Lista", "Legenda")
+- [x] **ja / zh / ko** — completate (EN→lingua). ~80% caratteri nativi; il resto sono nomi propri, sigle e numeri (normale per UI CJK)
+
+Manutenzione (ricorrente):
+
+- [ ] Ogni nuova feature: aggiungere le nuove chiavi a **tutte e 11** le lingue, non solo a `it.json` — altrimenti il test `i18n-locale-integrity` fallisce (chiavi mancanti).
+- [ ] Release: `scripts/release-all.js` (step 5) scrive il changelog i18n **solo in italiano** se manca una API key di traduzione → tradurre poi `changelog.vX_Y_Z` nelle altre 10 lingue (come fatto per v1.10.2).
+- [ ] I "leftover italiani" residui in baseline (es/pt/fr/pl) sono cognati legittimi, **non** errori: non forzare traduzioni innaturali solo per azzerare il contatore.
+
+---
+
+## 🧊 POST-RELEASE — Roadmap motori
+
+> Ogni nuovo motore è un traguardo a sé, con la stessa logica condizionale dell'item MelonLoader. Non "supporto 1000 giochi" — "supporto Ren'Py, poi RPG Maker, poi Unity…".
+
+- [~] **RPG Maker MV/MZ** — Secondo motore (marketing: To the Moon, OMORI…). *Implementato 23/06 — resta solo il collaudo manuale sui giochi reali.* Creato l'orchestratore `lib/rpgmaker-translate.ts` (detect MV/MZ → extract → traduzione Ollama con **glossario**, no voce → per file: `save_file_with_backup` + `apply_rpgmaker_translations` **in place**, con checkpoint/resume) e il **branch hero dedicato** in `startAutoTranslate` col **pannello stepper** (progress, risultato), come Ren'Py. ⚠️ **Scoping fatto**: il **classico** (RPG_RT 2000/2003) ora mostra un **messaggio onesto** + azione "Apri OCR" (niente più dirottamento silenzioso); hero file-based limitato a MV/MZ. QA: checklist `docs/RPGMAKER_COLLAUDO_CHECKLIST.md` + script `scripts/validate-rpgmaker.js` (backup presente, JSON validi, codici `\C[n]`/`%d` integri). tsc + eslint verdi. **Resta**: collaudo end-to-end su 4-5 giochi MV/MZ reali (app + Ollama + giochi).
+- [ ] **Unity** — *Attenzione: non partire da qui.* XUnity.AutoTranslator fa già traduzione a runtime via BepInEx → rischio di duplicare l'overlay live. IL2CPP / asset bundle sono complessi. Valutare solo dopo che l'hero RPG Maker è blindato.
+- [ ] **Unreal Engine** — Estrazione/ripacking da `.pak`/`.locres`. Più complesso, dopo Unity.
+- [ ] **MelonLoader come alternativa BepInEx IL2CPP** — Solo se arrivano ≥3 segnalazioni utente di giochi Unity IL2CPP dove `BepInEx v6.0.0-pre.2 IL2CPP` non aggancia. Richiede: nuove URL in `src-tauri/src/commands/unity_patcher.rs` (partire da MelonLoader `v0.7.3` (14 mag 2026, ultima stabile) + Il2CppInterop `1.5.1-ci.845`), build XUnity.AutoTranslator compatibile MelonLoader (probabile fork community come `sevenl72/XUnity.AutoTranslator` — verificare versione e manutenzione), logica di scelta loader nella UI "Gestisci patch", path installazione `Mods/` invece di `BepInEx/plugins/`. Stima: 1–2 giornate + QA su 3–4 giochi reali.
+
+---
+
+## 🔬 LABS — Fuoco d'artificio
+
+> Demo che fanno cadere la mascella. Non bloccano la release; vivono in Labs perché più rischiose sulla qualità.
+
+- [~] **Fandub AI** — Generare una traccia doppiata del gioco con voci di personaggio coerenti. Infra già presente (Whisper → traduzione → TTS + profili voce). Rischio qualità su timing/voci → Labs, non flusso-hero. *Esposto come Labs 23/06: pagina `app/dubbing/page.tsx` (pipeline `lib/voice/dubbing-pipeline.ts`) registrata in `tools-registry` con flag `experimental` + badge **Labs** nella Guida; banner d'avviso onesto su timing/voci sulla pagina; confermato FUORI dal flusso hero (`startAutoTranslate` non la tocca); sidebar invariata (rispetta le 19 voci). Resta: rifinitura qualità (timing/duration matching, voci) e collaudo end-to-end.*
+
+---
+
+## 💭 IDEE / FORSE (condizione-gated)
+
+> Legittime ma non azionabili ora. Restano visibili senza occupare la strada. Da promuovere solo quando scatta una condizione reale.
+
+- [ ] **Store PlayStation / Nintendo eShop** — Supporto store console, se fattibile.
+- [ ] **Espandere Database Nomi** — Più giochi popolari per tutti gli store.
+- [ ] **Real-time Collaboration** — Traduzione collaborativa in tempo reale.
+- [ ] **Cloud Sync** — Sincronizzazione cloud per traduzioni e impostazioni.
+- [ ] **Mobile Companion** — App mobile per gestione remota.
+- [ ] **Plugin System** — Sistema di plugin per estensioni di terze parti.
+- [ ] **Metriche aspirazionali** — `<3s startup`, `<100MB memory`, `99% uptime`, `<1s translation`. Da trattare come obiettivi solo dopo aver *misurato* un punto di partenza.
+
+---
+
+## 🧪 Verifica minore (non bloccante)
+
+- [ ] **Test GUI runtime OCR live** — Overlay OCR L3 / RPG Maker classico e fallback "Traduzione live OCR" verificati solo staticamente. *Non è più il flusso-hero* (intestabile a runtime, non differenziante). Resta come verifica opportunistica quando capita un gioco a portata di mano.
+- [x] **Community chat — diagnosi chiusa (17 giu 2026)** — NESSUN fix DB necessario: DB sano (817/817 profili, password bcrypt allineate, trigger `handle_new_user` ok). Il sintomo "mostra Accedi" era l'outage del backend del 15 giu (522/timeout), ora rientrato. Ritoccato solo il client (riconoscimento "utente esiste" esteso al 500 transitorio + commento corretto).
+- [x] **Revisione traduzione UI greca** — `el.json` rivisto (17 giu 2026): struttura allineata, 0 mismatch placeholder, frasi greche corrette; tradotte le ultime label descrittive residue, mantenuti brand/nomi prodotto/formati.
+
+---
+
+## 📚 Documentazione
+
+- [x] **Blocco 4 User Guide** — *Fatto 23/06.* Gap analisi: le feature AI erano quasi tutte già documentate (Vision LLM, Lore Assistant, Doppiaggio/Fandub, Fine-Tuning, Multi-LLM, Adaptive MT, Auto-Glossario, Profili Voce…). L'unica grande mancante era il **Prediction Tool (P.T.)** → aggiunta sezione completa in `docs/GUIDA_UTENTE.md` (Difficulty Score, stime/catene LLM, DRM/encoding/complessità, P.T.Rank, Dry Run, "String it!" Smart Gate, cache 24h, export). *(Mirror EN in `USER_GUIDE_EN.md` opzionale.)*
+- [x] **Tradurre docs tecnici** — *Fatto 23/06.* Creati `docs/API_REFERENCE_EN.md`, `docs/TROUBLESHOOTING_EN.md`, `docs/ARCHITETTURA_EN.md` (traduzione fedele). **Correzione 23/06**: `API_REFERENCE` NON è obsoleto — le route `/api/*` esistono e funzionano in web/dev; ma il build desktop usa `output:'export'` (static export → niente `/api`), quindi nel desktop si usa Tauri `invoke()`. Aggiunta nota **dual-mode** accurata in cima a `API_REFERENCE.md` e `_EN.md`. ⚠️ **Tech-debt scoperto**: ~10 file con `fetch('/api/...')` attivi (editor, subtitles, stores, dubbing, translator/pro…) → **rotti nel build desktop** (violano la regola "0 fetch('/api/')"). Da migrare a `invoke()` (task di CODICE separato).
+- [~] **Migrazione `fetch('/api')` → `invoke()`** — *Avviata 23/06.* Mappa completa per-endpoint in `docs/API_MIGRATION_MAP.md` (classificazione: invoke pronto / proxy→`fetch_url_content` / da creare / drop). **Pilota fatto**: `components/cover-picker.tsx` (`/api/covers/proxy` → `fetch_url_content` con fallback web, helper `proxyJson`+`isTauri`). Resta: i quick-win con comando già esistente (games, translations, export/patch, dictionaries, read-file), poi i casi con lavoro Rust (secrets, voice/transcribe, unity-ink, stores/auth). Un file alla volta + tsc/eslint.
+
+---
+
+## ✅ RECENTEMENTE COMPLETATO (Marzo 2026)
+
+### 🤖 Feature AI Avanzate — Documentazione Completa
+
+Tutte le 11 guide utente (IT, EN, ES, FR, DE, PT, JA, KO, ZH, RU, PL) aggiornate con 12 sezioni AI:
+
+**Blocco 1** — Feature AI Core:
+
+- ✅ Confronto Multi-LLM (3+ provider in parallelo, selezione automatica)
+- ✅ Punteggio Qualità Live (Fluency, Accuracy, Consistency, Style)
+- ✅ Profili Voce Personaggio (8 preset, personalità, speech patterns)
+- ✅ Pipeline Traduzione Vocale (Whisper → Traduzione → TTS)
+
+**Blocco 2** — OCR & Traduzione Avanzata:
+
+- ✅ OCR Multi-Engine (OneOCR, PaddleOCR, RapidOCR, Tesseract + fallback)
+- ✅ Retro-Game OCR (preset 8-bit/16-bit/DOS, preprocessing dedicato)
+- ✅ Adaptive MT (correzioni umane, few-shot learning, feedback loop)
+- ✅ Batch Folder Translator (scansione ricorsiva, multi-formato, TM, QA)
+
+**Blocco 3** — Traduzione Specializzata & Glossario:
+
+- ✅ Traduttore Offline (Ollama, HY-MT 1.5, TranslateGemma, Qwen 3, 14 lingue)
+- ✅ Manga/Comic Translator (balloon detection, OCR, inpainting, font matching)
+- ✅ Texture Translator (DDS/PNG/TGA, region detection, stile preservato)
+- ✅ Auto-Glossario (estrazione LLM, 3 tier, 11 categorie, prompt injection)
+
+### 🧹 Pulizia Progetto (Marzo 2026)
+
+- ✅ **7 docs spostati in archive/** — Report implementazione superati
+- ✅ **20 file temporanei eliminati da scripts/** — Fix/debug/inserimento una-tantum
+- ✅ **8 file obsoleti eliminati dalla root** — README_OLD, bug report, landing page duplicate, script utility
+- ✅ **Script verifica aggiornato** — `scripts/verify-ai-advanced.py` verifica 12 sezioni × 11 guide
+
+### 🚀 Ottimizzazione Performance e Libreria
+
+- **Guard globalThis**: Eliminati doppi fetch causati da React 18 StrictMode.
+- **Cache IndexedDB e In-Memory**: Cache con TTL 5-15 min per copertine, date, lingue.
+- **Zero HTTP Calls per Scan**: `scan_all_steam_games_fast` solo dati locali, eliminando 1600+ richieste.
+- **Deduplicazione Fetch**: Fixati doppi download su SteamGridDB.
+- **Internazionalizzazione**: Supporto completo 11 lingue UI.
+
+### 🎮 Store & Supporto
+
+- **Microsoft Store / Xbox Game Pass**: Scanner completo (`xbox.rs`).
+- **Epic Games Parser**: Filtro basato su `categories`.
+- **Steam Family Sharing**: Integrazione `steam_family_*` via file ACF.
+- **GOG Galaxy**: Supporto completo (v1.4.1).
+
+### 🐛 Bug Fix
+
+- **Memory Usage**: List view virtualizzata (`Virtuoso`), fix closure stale.
+- **Cache Corruption**: Recovery automatico JSON corrotto.
+- **CI/CD**: Fix compilazione Rust cross-platform, stub frontend per cargo check.
+
+---
+
+## 📚 ARCHIVIO SUCCESSI CORE (2025)
+
+*Task fondazionali già stabili.*
+
+- **Architettura Full-Stack**: Tauri v2 + Next.js + Rust bridge.
+- **Sistema Injection (Injekt)**: Multi-processo, anti-cheat bypass (7+ sistemi), hook pooling.
+- **Motori OCR & ML**: Tesseract/WindowsOCR/EasyOCR, fallback asincroni, ML scoring.
+- **Integrazioni API**: Cloudflare/Akamai per immagini, HowLongToBeat, traduzione multilingua.
+- **Tooling Rust**: Stabilizzazione compilatore, fix massivi binari Tauri, memory audit.
+
+---
+
+## 🔧 SETUP DEVELOPMENT
+
+### 📋 Prerequisiti
+
+- **Rust Toolchain** — `stable` (via `rustup`)
+- **Node.js 18+** — Ambiente Node.js aggiornato
+- **Tauri CLI v2** — `cargo install tauri-cli`
+- **Git Hooks** — Pre-commit hooks configurati in `.githooks/`
+
+### 🚀 Comandi Utili
+
+```bash
+# Sviluppo
+npm run tauri:dev          # Avvia app in modalità sviluppo
+npm run dev                # Solo frontend (per debug UI)
+npm run build:tauri        # Build produzione
+
+# Testing
+npm run test               # Test suite completa
+npm run test:rust          # Test solo backend Rust
+npm run test:frontend      # Test solo frontend
+
+# Verifica documentazione
+python scripts/verify-ai-advanced.py  # Verifica 12 sezioni × 11 guide
+
+# Maintenance
+npm run lint               # Check codice TS/JS
+npm run format             # Formatta codice
+cargo update               # Aggiorna dipendenze Rust
+cargo clippy               # Linting codice Rust
+```
+
+## 📝 NOTE SVILUPPO
+
+### 🎯 Principi Guida
+
+1. **Traduzione First** — Ogni feature deve supportare l'obiettivo principale di traduzione
+2. **Performance** — Ottimizzazione continua per responsività
+3. **Sicurezza** — Crittografia e protezione dati utente
+4. **Usabilità** — UI intuitiva e accessibile
+
+### 🔍 Aree di Attenzione
+
+- **Memory Management** — Monitoraggio continuo uso memoria
+- **Cross-Platform** — Compatibilità Windows/Linux/macOS
+- **Backward Compatibility** — Supporto versioni precedenti
+
+---
+
+## 📞 CONTATTI SVILUPPO
+
+**Repository**: <https://github.com/rouges78/GameStringer>
+**Issues**: Utilizzare GitHub Issues per bug report
+**Discussions**: GitHub Discussions per feature request
+
+---
+
+*Questo TODO.md viene aggiornato regolarmente. Controllare sempre la versione più recente.*

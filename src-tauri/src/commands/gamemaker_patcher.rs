@@ -1,0 +1,2500 @@
+// GameMaker data.win string extractor & patcher
+// Parses IFF-format data.win files to extract/replace strings from the STRG chunk.
+// Compatible with GameMaker Studio 1.x, 2.x, and 2.3+.
+
+use std::collections::HashMap;
+use std::fs;
+// std::io imports removed — patching uses extend_from_slice on Vec<u8>
+use std::path::{Path, PathBuf};
+use serde::{Deserialize, Serialize};
+use crate::commands::encoding_utils;
+
+// ── Types ──
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GmString {
+    pub index: usize,
+    pub offset: u64,       // offset in data.win del puntatore nella string table
+    pub data_offset: u64,  // offset dove inizia il contenuto stringa
+    pub original: String,
+    pub translated: Option<String>,
+    pub length: usize,
+    pub is_translatable: bool, // euristica: contiene testo visibile?
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GmDataInfo {
+    pub file_path: String,
+    pub file_size: u64,
+    pub gm_version: String,
+    pub total_strings: usize,
+    pub translatable_strings: usize,
+    pub chunks: Vec<String>,
+    pub is_yyc: bool,         // true if game is compiled with YYC (text in EXE, not data.win)
+    pub exe_path: Option<String>, // path to game executable (for YYC games)
+    pub has_language_files: bool,  // true if game has language/*.jn files
+    pub language_dir: Option<String>, // path to language directory
+    pub language_file_count: usize, // number of .jn files in engLanguage/
+    pub string_source: String,  // "strg", "exe", or "language_files"
+}
+
+/// Stringa la cui traduzione non entrava nello spazio dell'originale.
+///
+/// Sia `rebuild_same_size` (data.win) sia `patch_exe` (YYC) riscrivono in
+/// place: se la traduzione e' piu' lunga dell'originale viene tagliata. Prima
+/// succedeva in silenzio e l'utente pubblicava una patch con testo mozzato
+/// senza accorgersene; ora ogni taglio finisce qui e la UI lo mostra.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GmTruncatedString {
+    pub index: usize,
+    pub original: String,
+    /// Traduzione richiesta (intera, non tagliata).
+    pub translated: String,
+    /// Testo effettivamente scritto nel file.
+    pub written: String,
+    /// Byte disponibili per il testo in quello slot.
+    pub available_bytes: usize,
+    /// Byte richiesti dalla traduzione completa.
+    pub needed_bytes: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GmPatchResult {
+    pub success: bool,
+    pub patched_count: usize,
+    pub backup_path: String,
+    pub message: String,
+    /// Traduzioni tagliate per mancanza di spazio (vuoto = nessun taglio).
+    pub truncated: Vec<GmTruncatedString>,
+}
+
+// ── IFF Chunk parsing helpers ──
+
+// IffChunk struct omitted — we use tuples in parse_chunks instead
+
+fn read_u32_le(data: &[u8], pos: usize) -> u32 {
+    if pos + 4 > data.len() { return 0; }
+    u32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]])
+}
+
+#[allow(dead_code)]
+fn _write_u32_le(data: &mut [u8], pos: usize, val: u32) {
+    let bytes = val.to_le_bytes();
+    data[pos..pos+4].copy_from_slice(&bytes);
+}
+
+/// Read a length-prefixed string from data at given offset.
+/// GameMaker STRG strings may be UTF-8, Windows-1252, or Shift-JIS.
+fn read_gm_string(data: &[u8], offset: usize) -> String {
+    if offset >= data.len() { return String::new(); }
+    // GameMaker strings: 4-byte length prefix, then chars, then null terminator
+    let len = read_u32_le(data, offset) as usize;
+    let start = offset + 4;
+    let end = (start + len).min(data.len());
+    if start >= data.len() { return String::new(); }
+    let bytes = &data[start..end];
+    // Try UTF-8 first (most common in modern GameMaker)
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return s.to_string();
+    }
+    // Non-UTF-8: detect encoding (Windows-1252, Shift-JIS, etc.)
+    // Note: STRG strings are never UTF-16, so we use detect_encoding but
+    // override any false-positive BOM detection (short byte sequences can
+    // coincidentally start with 0xFF 0xFE).
+    let enc_result = encoding_utils::detect_encoding(bytes);
+    let encoding = if enc_result.encoding.starts_with("utf-16") {
+        // STRG chunk strings are single-byte or multi-byte, never UTF-16;
+        // fall back to Windows-1252 which covers the full 0x00-0xFF range.
+        "windows-1252"
+    } else {
+        &enc_result.encoding
+    };
+    encoding_utils::decode_string(bytes, encoding)
+}
+
+/// Detect GM version from chunks present
+fn detect_version(chunks: &[String]) -> String {
+    if chunks.contains(&"SEQN".to_string()) || chunks.contains(&"FEDS".to_string()) {
+        "Studio 2.3+".to_string()
+    } else if chunks.contains(&"TGIN".to_string()) {
+        "Studio 2.x".to_string()
+    } else {
+        "Studio 1.x".to_string()
+    }
+}
+
+/// Heuristic: is this string translatable (visible user text)?
+/// Key insight: real game text contains spaces (sentences, descriptions).
+/// Internal resource names (sprites, sounds, objects) are snake_case without spaces.
+fn is_translatable(s: &str) -> bool {
+    let s = s.trim();
+    // Skip empty or very short
+    if s.len() < 3 { return false; }
+    // Skip pure numbers / floats
+    if s.parse::<f64>().is_ok() { return false; }
+    // Skip file paths
+    if s.contains('/') || s.contains('\\') { return false; }
+    // Skip file extensions
+    let lower = s.to_lowercase();
+    if lower.ends_with(".ogg") || lower.ends_with(".wav") || lower.ends_with(".mp3")
+       || lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".gif")
+       || lower.ends_with(".bmp") || lower.ends_with(".json") || lower.ends_with(".csv")
+       || lower.ends_with(".xml") || lower.ends_with(".ini") || lower.ends_with(".txt")
+       || lower.ends_with(".gml") || lower.ends_with(".yy") || lower.ends_with(".yyp") {
+        return false;
+    }
+    if s.starts_with('.') && s.len() < 10 { return false; }
+    // Skip hex colors
+    if s.starts_with('#') && s.len() <= 9 && s[1..].chars().all(|c| c.is_ascii_hexdigit()) {
+        return false;
+    }
+    // Skip if no letter at all
+    if !s.chars().any(|c| c.is_alphabetic()) { return false; }
+    // Skip very long strings (likely code blocks)
+    if s.len() > 5000 { return false; }
+    // Skip GML code patterns
+    if s.contains("var ") && s.contains(";") { return false; }
+    if s.contains("function(") || s.contains("if (") || s.contains("while (") { return false; }
+    if s.contains("&&") || s.contains("||") || s.contains("!=") { return false; }
+    if s.contains("global.") || s.contains("self.") || s.contains("other.") { return false; }
+    // Skip known GM internal prefixes (very comprehensive)
+    if lower.starts_with("@@") || lower.starts_with("$$") { return false; }
+
+    // ── GameMaker resource prefixes ──
+    // Standard GM resource prefixes
+    const GM_PREFIXES: &[&str] = &[
+        "gml_", "scr_", "obj_", "spr_", "snd_", "rm_", "bg_", "fnt_", "tl_",
+        "seq_", "ds_", "ev_", "__",
+        // Sprite / visual asset prefixes (WOH-style and generic)
+        "s_", "scard_", "shaus_", "smenu_", "smap_", "shud_", "ssumm_",
+        // Sound / music prefixes
+        "nes_", "sfx_", "ost_", "voc_", "ness_",
+        // Character sprite prefixes
+        "char_",
+        // UI / menu prefixes
+        "menu_", "menut_",
+        // Audio group prefixes  
+        "audiogroup_",
+        // Pattern / card / god prefixes
+        "pattern_", "cardgod_",
+        // Other common GM resource prefixes
+        "sprite", "sound", "font", "path", "timeline", "object", "room",
+        // Control/system prefixes
+        "vk_", "mb_", "cr_", "os_", "gp_", "buffer_",
+    ];
+    for prefix in GM_PREFIXES {
+        if lower.starts_with(prefix) {
+            return false;
+        }
+    }
+
+    // ── Key rule: real translatable text almost always contains spaces ──
+    // Internal identifiers (theme_combat, select_god, combat_win) do NOT have spaces.
+    // Real game text: "FRESH MEAT - gain a mysterious meat", "Choose your character", etc.
+    let has_space = s.contains(' ');
+    
+    if !has_space {
+        // Single words are NOT translatable in the STRG path. Measured on the
+        // real Deltarune demo data.win (06/08/2026, scripts/gm-strg-probe.js):
+        // 6,963 single words passed the old heuristics, of which 6,087 all-
+        // lowercase GML literals ("actcon", "abletotarget", "left", "idle")
+        // that the game compares with `==` — translating them to Cyrillic
+        // kills the boot WITHOUT corrupting the file (the telemetry pattern
+        // "patch success → boot failure" on 1.14.0/1.15.0). No lexical rule
+        // separates "Cancel" from "active": real labels and load-bearing
+        // literals are the same English words. An untranslated label is
+        // recoverable; a game that no longer boots is not.
+        return false;
+    }
+
+    // Has spaces — very likely real text. Final sanity checks:
+    // Skip if it looks like a comma-separated list of identifiers
+    let words: Vec<&str> = s.split_whitespace().collect();
+    if words.len() >= 2 && words.iter().all(|w| w.contains('_') && !w.contains(' ')) {
+        return false; // list of identifiers separated by spaces
+    }
+
+    true
+}
+
+// ── Main parsing ──
+
+/// Parse data.win and list all chunks
+///
+/// Restituisce `(magic, dimensione, offset dei dati)`. `pub(crate)` perché la
+/// usa anche `gm_font`: l'analisi IFF va fatta in un punto solo, o le due copie
+/// divergono al primo caso limite.
+pub(crate) fn parse_chunks(data: &[u8]) -> Vec<(String, u32, u64)> {
+    let mut chunks = Vec::new();
+    if data.len() < 8 { return chunks; }
+    // Verify FORM header
+    if &data[0..4] != b"FORM" { return chunks; }
+    let form_size = read_u32_le(data, 4) as u64;
+    
+    let mut pos: u64 = 8; // after FORM + size
+    let end = (8 + form_size).min(data.len() as u64);
+    
+    while pos + 8 <= end {
+        let p = pos as usize;
+        let magic = String::from_utf8_lossy(&data[p..p+4]).to_string();
+        let size = read_u32_le(data, p + 4);
+        chunks.push((magic, size, pos + 8)); // data starts after magic+size
+        pos += 8 + size as u64;
+        // Align to 4 bytes (some GM versions)
+        // Actually GM IFF doesn't require alignment, chunks are contiguous
+    }
+    chunks
+}
+
+/// Extract strings from the STRG chunk
+fn extract_strings(data: &[u8], strg_offset: u64, _strg_size: u32) -> Vec<GmString> {
+    let mut strings = Vec::new();
+    let off = strg_offset as usize;
+    
+    if off + 4 > data.len() { return strings; }
+    let count = read_u32_le(data, off) as usize;
+    
+    // String table: count, then count u32 pointers to string data
+    // Each pointer is an absolute offset from start of file
+    let table_start = off + 4;
+    
+    for i in 0..count {
+        let ptr_offset = table_start + i * 4;
+        if ptr_offset + 4 > data.len() { break; }
+        let str_abs_offset = read_u32_le(data, ptr_offset) as usize;
+        
+        if str_abs_offset + 4 > data.len() { continue; }
+        let text = read_gm_string(data, str_abs_offset);
+        let translatable = is_translatable(&text);
+        let len = text.len();
+        
+        strings.push(GmString {
+            index: i,
+            offset: ptr_offset as u64,
+            data_offset: str_abs_offset as u64,
+            original: text,
+            translated: None,
+            length: len,
+            is_translatable: translatable,
+        });
+    }
+    strings
+}
+
+// ── YYC EXE string extraction ──
+
+/// Find the game executable in game directory
+/// Trova l'eseguibile del gioco nella cartella.
+///
+/// Prima restituiva il PRIMO `.exe` in ordine di lettura, con un filtro
+/// parziale che non escludeva GameStringer stesso: se la portable era copiata
+/// nella cartella del gioco, veniva lanciata lei. Ora usa le regole condivise
+/// di `game_exe` e sceglie il candidato migliore (nome che combacia con la
+/// cartella, poi il binario più grande), come già fa
+/// `find_executables_in_folder`.
+fn find_game_exe(game_path: &str) -> Option<PathBuf> {
+    use super::game_exe::{is_junk_executable, name_match_score};
+
+    let dir = Path::new(game_path);
+    let folder_name = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    let mut best: Option<(u8, u64, PathBuf)> = None;
+    for entry in fs::read_dir(dir).ok()?.flatten() {
+        let p = entry.path();
+        if !p.is_file() {
+            continue;
+        }
+        if !p.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("exe")).unwrap_or(false) {
+            continue;
+        }
+        let file_name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if is_junk_executable(file_name) {
+            continue;
+        }
+        let stem = p.file_stem().and_then(|n| n.to_str()).unwrap_or("");
+        let score = name_match_score(stem, &folder_name);
+        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        if best.as_ref().map(|(bs, bz, _)| (score, size) > (*bs, *bz)).unwrap_or(true) {
+            best = Some((score, size, p));
+        }
+    }
+    best.map(|(_, _, p)| p)
+}
+
+/// Heuristic: is this EXE string translatable game text?
+fn is_translatable_exe_string(s: &str) -> bool {
+    let s = s.trim();
+    if s.len() < 8 { return false; }
+    // Must contain a space (real text, not identifiers)
+    if !s.contains(' ') { return false; }
+    // Must have letters
+    if !s.chars().any(|c| c.is_alphabetic()) { return false; }
+    
+    let lower = s.to_lowercase();
+    
+    // ── Structural text quality checks ──
+    // x86 machine code decoded as ASCII produces strings like "L$ UVWATAUAVAWH",
+    // "D$(9D$ }\HcD$ H", "uVfE9E uOfE9E0". These pass naive word-count checks
+    // because they contain letter sequences. We need deeper structural analysis.
+    
+    // Split into "tokens" separated by non-alphanumeric chars
+    let tokens: Vec<&str> = s.split(|c: char| !c.is_alphanumeric()).filter(|t| !t.is_empty()).collect();
+    
+    // Count tokens that look like real words:
+    // - 3+ chars
+    // - Contains at least one vowel AND one consonant (not all-consonant gibberish)
+    // - Not a mix of digits and letters (like "9r", "E9Z", "D24")
+    let vowels = "aeiouAEIOU";
+    let mut real_word_count = 0usize;
+    let mut letter_count = 0usize;
+    
+    for token in &tokens {
+        let has_digit = token.chars().any(|c| c.is_ascii_digit());
+        let has_letter = token.chars().any(|c| c.is_alphabetic());
+        let letter_chars: String = token.chars().filter(|c| c.is_alphabetic()).collect();
+        
+        // Count letters globally
+        letter_count += token.chars().filter(|c| c.is_alphabetic()).count();
+        
+        // Skip tokens that mix digits and letters (x86 artifact: "9r", "E9Z", "H0u")
+        if has_digit && has_letter { continue; }
+        
+        // Only consider letter-only tokens of 3+ chars
+        if letter_chars.len() < 3 { continue; }
+        
+        let has_vowel = letter_chars.chars().any(|c| vowels.contains(c));
+        let has_consonant = letter_chars.chars().any(|c| c.is_alphabetic() && !vowels.contains(c));
+        
+        // Real words have vowels AND consonants
+        if has_vowel && has_consonant {
+            real_word_count += 1;
+        }
+    }
+    
+    // Must have at least 2 real words
+    if real_word_count < 2 { return false; }
+    // Letters must be at least 40% of total
+    let letter_ratio = letter_count as f64 / s.len() as f64;
+    if letter_ratio < 0.40 { return false; }
+    
+    // ── Known non-game patterns ──
+    if lower.contains("dos mode") || lower.contains("this program") { return false; }
+    
+    // ── C format strings / GM runtime error messages ──
+    // These contain %d, %s, %f, %i, %u patterns (printf-style)
+    if s.contains("%d") || s.contains("%s") || s.contains("%f") || s.contains("%i") || s.contains("%u") || s.contains("%x") || s.contains("%p") {
+        return false;
+    }
+    // GM runtime/engine error messages
+    if lower.contains("index out of bounds") { return false; }
+    if lower.contains("not an array") || lower.contains("not a number") { return false; }
+    if lower.contains("unable to") && (lower.contains("convert") || lower.contains("add") || lower.contains("find") || lower.contains("allocate")) { return false; }
+    if lower.contains("invalid type") || lower.contains("invalid argument") { return false; }
+    if lower.contains("stack overflow") || lower.contains("out of memory") { return false; }
+    if lower.contains("trying to") && (lower.contains("index") || lower.contains("access") || lower.contains("read") || lower.contains("write")) { return false; }
+    if lower.contains("variable") && (lower.contains("not set") || lower.contains("not found") || lower.contains("uninitialized")) { return false; }
+    if lower.contains("array") && (lower.contains("expected") || lower.contains("bounds") || lower.contains("dimension")) { return false; }
+    if lower.contains("argument count") || lower.contains("wrong number") { return false; }
+    if lower.contains("division by zero") || lower.contains("negative value") { return false; }
+    if lower.contains("ds_") && lower.contains("does not exist") { return false; }
+    if lower.contains("instance") && lower.contains("does not exist") { return false; }
+    if lower.contains("fatal error") || lower.contains("unhandled exception") { return false; }
+    if lower.contains("assertion") || lower.contains("debug_break") { return false; }
+    
+    // ── Shader / GPU code ──
+    if lower.contains("#define") || lower.contains("#include") || lower.contains("#version") { return false; }
+    if lower.contains("precision ") && lower.contains("float") { return false; }
+    if lower.contains("sampler2d") || lower.contains("uniform ") { return false; }
+    if lower.contains("vec4 ") || lower.contains("vec3 ") || lower.contains("float ") { return false; }
+    if lower.starts_with("//") { return false; }
+    if lower.contains("matrix") && lower.contains("view") { return false; }
+    if lower.contains("register(") { return false; }
+    if lower.contains("microsoft") && (lower.contains("compiler") || lower.contains("shader")) { return false; }
+    
+    // ── OS / System strings ──
+    if lower.contains(".dll") || lower.contains(".exe") || lower.contains(".sys") { return false; }
+    if lower.contains("kernel32") || lower.contains("ntdll") || lower.contains("advapi") || lower.contains("user32") { return false; }
+    if lower.contains("hresult") || lower.contains("win32") || lower.contains("directx") { return false; }
+    if lower.contains("copyright") && lower.contains("microsoft") { return false; }
+    
+    // ── GML code patterns ──
+    if lower.contains("global.") || lower.contains("self.") || lower.contains("other.") { return false; }
+    if lower.contains("var ") && lower.contains(";") { return false; }
+    if lower.contains("function(") || lower.contains("if (") || lower.contains("while (") { return false; }
+    if lower.contains("&&") || lower.contains("||") || lower.contains("!=") { return false; }
+    if lower.contains("gml_") || lower.contains("obj_") || lower.contains("scr_") { return false; }
+    if lower.contains("ds_map") || lower.contains("ds_list") || lower.contains("ds_grid") { return false; }
+    
+    // ── Save file / config / debug strings ──
+    if lower.contains("save file") && lower.contains("for ") { return false; }
+    if lower.contains("[debug]") || lower.contains("[error]") || lower.contains("[warning]") { return false; }
+    if lower.contains("[load]") || lower.contains("[save]") { return false; }
+    // Dev log messages: "something loaded:", "something not found!", "something failed:"
+    if lower.ends_with(':') && s.len() < 40 { return false; }
+    if lower.contains("not found") && s.len() < 50 { return false; }
+    if lower.contains("loaded:") || lower.contains("loading:") || lower.contains("failed:") { return false; }
+    if lower.contains("folder not found") || lower.contains("file not found") { return false; }
+    if lower.contains("initialized") && s.len() < 50 { return false; }
+    
+    true
+}
+
+/// Extract readable text strings from a YYC-compiled EXE binary
+fn extract_exe_strings(data: &[u8], min_len: usize) -> Vec<GmString> {
+    let mut strings = Vec::new();
+    let mut i = 0;
+    let mut index = 0;
+    
+    while i < data.len() {
+        // Find start of a readable ASCII sequence
+        if data[i] >= 0x20 && data[i] <= 0x7e || data[i] == b'\r' || data[i] == b'\n' || data[i] == b'\t' {
+            let start = i;
+            while i < data.len() && (data[i] >= 0x20 && data[i] <= 0x7e || data[i] == b'\r' || data[i] == b'\n' || data[i] == b'\t') {
+                i += 1;
+            }
+            let len = i - start;
+            if len >= min_len {
+                if let Ok(text) = std::str::from_utf8(&data[start..i]) {
+                    let text = text.trim();
+                    if text.len() >= min_len {
+                        let translatable = is_translatable_exe_string(text);
+                        strings.push(GmString {
+                            index,
+                            offset: start as u64,
+                            data_offset: start as u64,
+                            original: text.to_string(),
+                            translated: None,
+                            length: len,
+                            is_translatable: translatable,
+                        });
+                        index += 1;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    strings
+}
+
+// ── Tauri Commands ──
+
+/// Find data.win in game directory
+///
+/// `pub(crate)` perché la usa anche `gm_font_patcher`: la ricerca del file va
+/// fatta in un punto solo.
+pub(crate) fn find_data_win(game_path: &str) -> Option<PathBuf> {
+    let dir = Path::new(game_path);
+    // Direct data.win
+    let dw = dir.join("data.win");
+    if dw.exists() { return Some(dw); }
+    // game.unx (Linux)
+    let unx = dir.join("game.unx");
+    if unx.exists() { return Some(unx); }
+    // game.ios
+    let ios = dir.join("game.ios");
+    if ios.exists() { return Some(ios); }
+    // Subdirectories
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_file() {
+                if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                    if name == "data.win" || name == "game.unx" || name == "game.ios" {
+                        return Some(p);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Find language directory with .jn files (e.g. language/engLanguage/)
+fn find_language_dir(game_path: &str) -> Option<(PathBuf, PathBuf)> {
+    let dir = Path::new(game_path);
+    let lang_dir = dir.join("language");
+    if !lang_dir.is_dir() { return None; }
+    
+    // Look for engLanguage/ (English source for translations)
+    let eng_dir = lang_dir.join("engLanguage");
+    if eng_dir.is_dir() {
+        // Check if it has .jn files
+        if let Ok(entries) = fs::read_dir(&eng_dir) {
+            let jn_count = entries.flatten()
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "jn"))
+                .count();
+            if jn_count > 0 {
+                return Some((lang_dir, eng_dir));
+            }
+        }
+    }
+    None
+}
+
+// ── Formato Deltarune: lang/lang_<codice>[_ch<N>].json ──────────────────────
+//
+// Verificato sulla demo gratuita il 26/07/2026 (docs/maintenance/2026-07-26-deltarune-analisi.md):
+//
+//   lang/lang_en_ch1.json   6.242 chiavi   ← sorgente inglese, Chapter 1
+//   lang/lang_ja_ch1.json                  ← giapponese, Chapter 1
+//   lang/lang_ja.json      13.031 chiavi   ← giapponese, Chapter 2
+//
+// JSON piatto, chiave → stringa. Le chiavi sono nomi di script GameMaker
+// (`DEVICE_CONTACT_slash_Step_0_gml_6_0`) e i valori contengono i marcatori del
+// motore di dialogo: `^6` pausa, `&` a capo, `\M0` espressione del volto, `%` fine
+// messaggio. Vanno preservati: ci pensa il placeholder guard a monte.
+//
+// NB: `lang_en.json` (Chapter 2 inglese) NON esiste — quel testo sta dentro data.win,
+// solo il giapponese è esternalizzato. Qui copriamo i capitoli che hanno una sorgente
+// inglese su disco; per gli altri resta la via dello STRG chunk.
+//
+// Il gioco è a due lingue (`global.lang`, `os_get_language`, font paralleli
+// `fnt_ja_*`): per far comparire una traduzione si sovrascrive il file giapponese
+// corrispondente, che è ciò che fa `patch_json_lang_files`.
+
+/// File di lingua Deltarune: sorgente inglese e file giapponese da sovrascrivere.
+struct JsonLangPair {
+    source: PathBuf,
+    target: PathBuf,
+}
+
+/// `lang/` con almeno una coppia `lang_en*.json` + `lang_ja*.json`.
+fn find_json_lang_dir(game_path: &str) -> Option<(PathBuf, Vec<JsonLangPair>)> {
+    let lang_dir = Path::new(game_path).join("lang");
+    if !lang_dir.is_dir() {
+        return None;
+    }
+
+    let mut pairs: Vec<JsonLangPair> = Vec::new();
+    let mut names: Vec<String> = fs::read_dir(&lang_dir)
+        .ok()?
+        .flatten()
+        .filter_map(|e| {
+            let p = e.path();
+            if p.extension().is_some_and(|x| x == "json") {
+                p.file_name().map(|n| n.to_string_lossy().to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    names.sort();
+
+    for name in &names {
+        // `lang_en_ch1.json` → suffisso `_ch1`; `lang_en.json` → suffisso vuoto
+        let Some(rest) = name.strip_prefix("lang_en") else { continue };
+        let Some(suffix) = rest.strip_suffix(".json") else { continue };
+        let target_name = format!("lang_ja{}.json", suffix);
+        if names.iter().any(|n| n == &target_name) {
+            pairs.push(JsonLangPair {
+                source: lang_dir.join(name),
+                target: lang_dir.join(&target_name),
+            });
+        }
+    }
+
+    if pairs.is_empty() { None } else { Some((lang_dir, pairs)) }
+}
+
+/// Legge un file di lingua JSON come mappa piatta, saltando i valori non testuali.
+/// Tollera il BOM, che Deltarune usa su alcuni file.
+fn read_json_lang(path: &Path) -> Option<Vec<(String, String)>> {
+    let raw = fs::read_to_string(path).ok()?;
+    let cleaned = raw.trim_start_matches('\u{feff}');
+    let parsed: serde_json::Value = serde_json::from_str(cleaned).ok()?;
+    let obj = parsed.as_object()?;
+    Some(
+        obj.iter()
+            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+            .collect(),
+    )
+}
+
+/// Traducibilità per le stringhe dei file di lingua JSON (Deltarune-style).
+///
+/// NON usare `is_translatable`: quel filtro è pensato per il chunk STRG, dove
+/// convivono codice e testo, e scarta pattern da GML (`/`, `&&`, `global.`).
+/// Ma nei dialoghi Deltarune `/` è il marcatore "aspetta input" e `&&` sono
+/// due a capo consecutivi: applicarlo qui buttava via 4.650 stringhe vere su
+/// 6.121 (misurato il 28/07/2026 sulla demo: il contatore diceva 1471).
+/// In un file di lingua è GIÀ tutto testo: si salta solo ciò che non ha
+/// nemmeno una lettera, cioè le stringhe di soli marcatori/punteggiatura.
+fn is_translatable_json_lang(s: &str) -> bool {
+    s.chars().any(|c| c.is_alphabetic())
+}
+
+/// Stringhe traducibili nei file JSON, in ordine stabile fra scansione e patch.
+fn count_json_lang_strings(pairs: &[JsonLangPair]) -> (usize, usize) {
+    let mut total = 0usize;
+    for pair in pairs {
+        if let Some(entries) = read_json_lang(&pair.source) {
+            total += entries
+                .iter()
+                .filter(|(k, v)| k != "date" && is_translatable_json_lang(v))
+                .count();
+        }
+    }
+    (total, pairs.len())
+}
+
+fn extract_json_lang_strings(pairs: &[JsonLangPair]) -> Vec<GmString> {
+    let mut out = Vec::new();
+    let mut index = 0usize;
+    for pair in pairs {
+        let Some(entries) = read_json_lang(&pair.source) else { continue };
+        // `date` è un timestamp del gioco, non testo da tradurre
+        for (key, value) in entries.into_iter().filter(|(k, _)| k != "date") {
+            let translatable = is_translatable_json_lang(&value);
+            out.push(GmString {
+                index,
+                offset: 0,
+                data_offset: 0,
+                length: value.len(),
+                original: value,
+                translated: None,
+                is_translatable: translatable,
+            });
+            index += 1;
+            let _ = &key;
+        }
+    }
+    out
+}
+
+/// Scrive le traduzioni nel file giapponese, che è quello che il gioco carica quando
+/// `global.lang` non è inglese. L'originale viene salvato una volta sola in `.bak`,
+/// così ripatchare non parte mai da un file già tradotto.
+fn patch_json_lang_files(
+    pairs: &[JsonLangPair],
+    translations: &HashMap<usize, String>,
+) -> Result<GmPatchResult, String> {
+    let mut index = 0usize;
+    let mut patched = 0usize;
+
+    for pair in pairs {
+        let backup = pair.target.with_extension("json.bak");
+        if !backup.exists() && pair.target.exists() {
+            fs::copy(&pair.target, &backup)
+                .map_err(|e| format!("Errore backup {}: {}", pair.target.display(), e))?;
+        }
+
+        let Some(entries) = read_json_lang(&pair.source) else { continue };
+
+        // Traduzioni per CHIAVE, con la stessa numerazione di extract (indice
+        // progressivo sulle voci non-`date` del file sorgente).
+        let mut per_chiave: HashMap<String, String> = HashMap::new();
+        for (key, _) in &entries {
+            if key == "date" {
+                continue;
+            }
+            if let Some(t) = translations.get(&index) {
+                if !t.is_empty() {
+                    per_chiave.insert(key.clone(), t.clone());
+                }
+            }
+            index += 1;
+        }
+
+        // ⚠️ 28/07/2026: si riscrive il file di DESTINAZIONE partendo dalle SUE
+        // voci, non da quelle del sorgente. La prima versione ricostruiva il
+        // file giapponese dalle chiavi inglesi: le chiavi solo-giapponesi
+        // sparivano e le voci non tradotte prendevano il testo INGLESE invece
+        // di conservare l'originale giapponese.
+        // Base = il BACKUP quando esiste: cosi' ripatchare parte sempre dal
+        // giapponese originale, mai da un file gia' tradotto.
+        let base = if backup.exists() { &backup } else { &pair.target };
+        let Some(voci_target) = read_json_lang(base) else { continue };
+        let mut out = serde_json::Map::new();
+        for (key, valore_ja) in voci_target {
+            if key != "date" {
+                if let Some(t) = per_chiave.get(&key) {
+                    patched += 1;
+                    out.insert(key, serde_json::Value::String(t.clone()));
+                    continue;
+                }
+            }
+            out.insert(key, serde_json::Value::String(valore_ja));
+        }
+
+        let json = serde_json::to_string_pretty(&serde_json::Value::Object(out))
+            .map_err(|e| format!("Errore serializzazione JSON: {}", e))?;
+        fs::write(&pair.target, json)
+            .map_err(|e| format!("Errore scrittura {}: {}", pair.target.display(), e))?;
+        println!("[GM-JSON] Scritto {} ({} stringhe)", pair.target.display(), index);
+    }
+
+    Ok(GmPatchResult {
+        success: true,
+        patched_count: patched,
+        backup_path: pairs
+            .first()
+            .map(|p| p.target.with_extension("json.bak").to_string_lossy().to_string())
+            .unwrap_or_default(),
+        message: format!("{} stringhe scritte nei file di lingua JSON", patched),
+        truncated: Vec::new(),
+    })
+}
+
+/// Count translatable strings in .jn files (format: "English text|Japanese text" per line)
+fn count_jn_strings(eng_dir: &Path) -> (usize, usize) {
+    let mut total = 0usize;
+    let mut file_count = 0usize;
+    
+    if let Ok(entries) = fs::read_dir(eng_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "jn") {
+                file_count += 1;
+                if let Ok(content) = fs::read_to_string(&path) {
+                    for line in content.lines() {
+                        let line = line.trim();
+                        if !line.is_empty() && line.contains('|') {
+                            total += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (total, file_count)
+}
+
+/// Extract strings from .jn files as GmString entries
+fn extract_jn_strings(eng_dir: &Path) -> Vec<GmString> {
+    let mut strings = Vec::new();
+    let mut index = 0;
+    
+    if let Ok(entries) = fs::read_dir(eng_dir) {
+        let mut paths: Vec<_> = entries.flatten().map(|e| e.path()).collect();
+        paths.sort();
+        
+        for path in paths {
+            if path.extension().is_none_or(|ext| ext != "jn") { continue; }
+            let _filename = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+            
+            if let Ok(content) = fs::read_to_string(&path) {
+                for (line_num, line) in content.lines().enumerate() {
+                    let line = line.trim();
+                    if line.is_empty() { continue; }
+                    
+                    // Format: "English text|Japanese text" or just "English text"
+                    let english_part = if let Some(pipe_pos) = line.find('|') {
+                        &line[..pipe_pos]
+                    } else {
+                        line
+                    };
+                    
+                    if english_part.is_empty() { continue; }
+                    
+                    strings.push(GmString {
+                        index,
+                        offset: line_num as u64,     // line number in file
+                        data_offset: 0,              // not used for .jn
+                        original: english_part.to_string(),
+                        translated: None,
+                        length: english_part.len(),
+                        is_translatable: true,       // all .jn strings are translatable
+                    });
+                    index += 1;
+                }
+            }
+        }
+    }
+    strings
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn gm_scan_data_win(game_path: String) -> Result<GmDataInfo, String> {
+    println!("[GM] Scanning in: {}", game_path);
+    
+    let data_win_path = find_data_win(&game_path)
+        .ok_or_else(|| "data.win non trovato nella cartella del gioco".to_string())?;
+    
+    let data = fs::read(&data_win_path)
+        .map_err(|e| format!("Errore lettura data.win: {}", e))?;
+    
+    let chunks = parse_chunks(&data);
+    let chunk_names: Vec<String> = chunks.iter().map(|(name, _, _)| name.clone()).collect();
+    let version = detect_version(&chunk_names);
+    
+    // ── Priority 0: lang/*.json (Deltarune e simili) ──
+    // Prima dei .jn: chi ha questi file non ha bisogno di toccare data.win, quindi
+    // niente rischio di troncamento.
+    if let Some((lang_dir, pairs)) = find_json_lang_dir(&game_path) {
+        let (json_total, file_count) = count_json_lang_strings(&pairs);
+        println!(
+            "[GM] Language JSON trovati: {} coppie en→ja, {} stringhe in {}",
+            file_count, json_total, lang_dir.display()
+        );
+
+        return Ok(GmDataInfo {
+            file_path: data_win_path.to_string_lossy().to_string(),
+            file_size: data.len() as u64,
+            gm_version: format!("{} (Language JSON)", version),
+            total_strings: json_total,
+            translatable_strings: json_total,
+            chunks: chunk_names,
+            is_yyc: false,
+            exe_path: None,
+            has_language_files: true,
+            language_dir: Some(lang_dir.to_string_lossy().to_string()),
+            language_file_count: file_count,
+            string_source: "language_json".to_string(),
+        });
+    }
+
+    // ── Priority 1: Check for language/*.jn files ──
+    if let Some((lang_dir, eng_dir)) = find_language_dir(&game_path) {
+        let (jn_total, jn_file_count) = count_jn_strings(&eng_dir);
+        println!("[GM] Language files found: {} .jn files, {} strings in {}", 
+                 jn_file_count, jn_total, eng_dir.display());
+        
+        return Ok(GmDataInfo {
+            file_path: data_win_path.to_string_lossy().to_string(),
+            file_size: data.len() as u64,
+            gm_version: format!("{} (Language Files)", version),
+            total_strings: jn_total,
+            translatable_strings: jn_total, // all .jn strings are translatable
+            chunks: chunk_names,
+            is_yyc: false,
+            exe_path: None,
+            has_language_files: true,
+            language_dir: Some(lang_dir.to_string_lossy().to_string()),
+            language_file_count: jn_file_count,
+            string_source: "language_files".to_string(),
+        });
+    }
+    
+    // ── Priority 2: STRG chunk analysis ──
+    let strg = chunks.iter().find(|(name, _, _)| name == "STRG");
+    let (strg_total, strg_translatable) = if let Some((_, size, offset)) = strg {
+        let strings = extract_strings(&data, *offset, *size);
+        let t = strings.iter().filter(|s| s.is_translatable).count();
+        (strings.len(), t)
+    } else {
+        (0, 0)
+    };
+    
+    // ── Priority 3: YYC detection → EXE scan ──
+    let yyc_threshold = (strg_total as f64 * 0.05) as usize;
+    let is_yyc = strg_translatable < yyc_threshold.max(50);
+    
+    let (total, translatable, exe_path, source) = if is_yyc {
+        if let Some(exe) = find_game_exe(&game_path) {
+            println!("[GM] YYC detected — scanning EXE: {}", exe.display());
+            match fs::read(&exe) {
+                Ok(exe_data) => {
+                    let exe_strings = extract_exe_strings(&exe_data, 15);
+                    let t = exe_strings.iter().filter(|s| s.is_translatable).count();
+                    println!("[GM] EXE: {} total, {} translatable", exe_strings.len(), t);
+                    (exe_strings.len(), t, Some(exe.to_string_lossy().to_string()), "exe")
+                }
+                Err(e) => {
+                    println!("[GM] Failed to read EXE: {}", e);
+                    (strg_total, strg_translatable, None, "strg")
+                }
+            }
+        } else {
+            (strg_total, strg_translatable, None, "strg")
+        }
+    } else {
+        (strg_total, strg_translatable, None, "strg")
+    };
+    
+    println!("[GM] Found {} strings ({} translatable) — source={}, YYC={}", 
+             total, translatable, source, is_yyc);
+    
+    Ok(GmDataInfo {
+        file_path: data_win_path.to_string_lossy().to_string(),
+        file_size: data.len() as u64,
+        gm_version: if is_yyc { format!("{} (YYC)", version) } else { version },
+        total_strings: total,
+        translatable_strings: translatable,
+        chunks: chunk_names,
+        is_yyc,
+        exe_path,
+        has_language_files: false,
+        language_dir: None,
+        language_file_count: 0,
+        string_source: source.to_string(),
+    })
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn gm_extract_strings(
+    game_path: String,
+    only_translatable: Option<bool>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> Result<Vec<GmString>, String> {
+    println!("[GM] Extracting strings from: {}", game_path);
+    
+    // ── Priority 0: lang/*.json (Deltarune e simili) ──
+    if let Some((_lang_dir, pairs)) = find_json_lang_dir(&game_path) {
+        let mut strings = extract_json_lang_strings(&pairs);
+        println!("[GM] Language JSON mode — {} stringhe", strings.len());
+
+        if only_translatable.unwrap_or(true) {
+            strings.retain(|s| s.is_translatable);
+        }
+        // offset+limit come nel ramo .jn. Il bug (28/07/2026): questo ramo
+        // applicava solo `truncate(limit)` ignorando `offset`, quindi ogni
+        // "pagina" erano LE STESSE prime 100 stringhe → "Traduci tutto"
+        // girava all'infinito: pagina mai vuota, tutto già tradotto, barra
+        // ferma a N/N. Trovato da Davide alla prima traduzione completa.
+        let start = offset.unwrap_or(0);
+        let count = limit.unwrap_or(100);
+        let end = (start + count).min(strings.len());
+        strings = if start < strings.len() {
+            strings[start..end].to_vec()
+        } else {
+            Vec::new()
+        };
+        println!("[GM] Returning {} strings (offset={}, limit={}, source=json)", strings.len(), start, count);
+        return Ok(strings);
+    }
+
+    // ── Priority 1: Language .jn files ──
+    if let Some((_lang_dir, eng_dir)) = find_language_dir(&game_path) {
+        let mut strings = extract_jn_strings(&eng_dir);
+        println!("[GM] Language files mode — {} strings from .jn files", strings.len());
+        
+        if only_translatable.unwrap_or(true) {
+            strings.retain(|s| s.is_translatable);
+        }
+        let start = offset.unwrap_or(0);
+        let count = limit.unwrap_or(100);
+        let end = (start + count).min(strings.len());
+        if start < strings.len() {
+            strings = strings[start..end].to_vec();
+        } else {
+            strings = vec![];
+        }
+        println!("[GM] Returning {} strings (offset={}, limit={}, source=jn)", strings.len(), start, count);
+        return Ok(strings);
+    }
+    
+    // ── Priority 2/3: STRG or EXE ──
+    let data_win_path = find_data_win(&game_path)
+        .ok_or_else(|| "data.win non trovato".to_string())?;
+    
+    let data = fs::read(&data_win_path)
+        .map_err(|e| format!("Errore lettura: {}", e))?;
+    
+    let chunks = parse_chunks(&data);
+    let strg = chunks.iter().find(|(name, _, _)| name == "STRG")
+        .ok_or_else(|| "Chunk STRG non trovato in data.win".to_string())?;
+    
+    let strg_strings = extract_strings(&data, strg.2, strg.1);
+    let strg_translatable = strg_strings.iter().filter(|s| s.is_translatable).count();
+    let is_yyc = strg_translatable < 50;
+    
+    let mut strings = if is_yyc {
+        if let Some(exe_path) = find_game_exe(&game_path) {
+            println!("[GM] YYC mode — extracting from EXE: {}", exe_path.display());
+            let exe_data = fs::read(&exe_path)
+                .map_err(|e| format!("Errore lettura EXE: {}", e))?;
+            extract_exe_strings(&exe_data, 15)
+        } else {
+            strg_strings
+        }
+    } else {
+        strg_strings
+    };
+    
+    if only_translatable.unwrap_or(true) {
+        strings.retain(|s| s.is_translatable);
+    }
+    
+    // Pagination
+    let start = offset.unwrap_or(0);
+    let count = limit.unwrap_or(100);
+    let end = (start + count).min(strings.len());
+    
+    if start < strings.len() {
+        strings = strings[start..end].to_vec();
+    } else {
+        strings = Vec::new();
+    }
+    
+    println!("[GM] Returning {} strings (offset={}, limit={}, yyc={})", strings.len(), start, count, is_yyc);
+    Ok(strings)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn gm_patch_strings(
+    game_path: String,
+    translations: HashMap<usize, String>, // index -> translated text
+) -> Result<GmPatchResult, String> {
+    println!("[GM] Patching {} strings in: {}", translations.len(), game_path);
+    
+    // ── Priority 0: lang/*.json (Deltarune e simili) ──
+    if let Some((_lang_dir, pairs)) = find_json_lang_dir(&game_path) {
+        return patch_json_lang_files(&pairs, &translations);
+    }
+
+    // ── Priority 1: Language .jn files → create itaLanguage/ ──
+    if let Some((lang_dir, eng_dir)) = find_language_dir(&game_path) {
+        return patch_language_files(&lang_dir, &eng_dir, &translations);
+    }
+    
+    // ── Priority 2/3: EXE or data.win ──
+    let data_win_path = find_data_win(&game_path)
+        .ok_or_else(|| "data.win non trovato".to_string())?;
+    
+    let data = fs::read(&data_win_path)
+        .map_err(|e| format!("Errore lettura data.win: {}", e))?;
+    
+    let chunks = parse_chunks(&data);
+    let strg = chunks.iter().find(|(name, _, _)| name == "STRG")
+        .ok_or_else(|| "Chunk STRG non trovato".to_string())?;
+    
+    let strg_strings = extract_strings(&data, strg.2, strg.1);
+    let strg_translatable = strg_strings.iter().filter(|s| s.is_translatable).count();
+    let is_yyc = strg_translatable < 50;
+    
+    if is_yyc {
+        patch_exe(&game_path, &translations)
+    } else {
+        patch_data_win(&data, &data_win_path, strg, &strg_strings, &translations)
+    }
+}
+
+/// Overwrite engLanguage/ .jn files with translations (backup to engLanguage.bak/)
+fn patch_language_files(
+    lang_dir: &Path,
+    eng_dir: &Path,
+    translations: &HashMap<usize, String>,
+) -> Result<GmPatchResult, String> {
+    // Backup engLanguage/ → engLanguage.bak/ (only first time)
+    let backup_dir = lang_dir.join("engLanguage.bak");
+    if !backup_dir.exists() {
+        println!("[GM-JN] Backup engLanguage/ → engLanguage.bak/");
+        fs::create_dir_all(&backup_dir)
+            .map_err(|e| format!("Errore creazione backup: {}", e))?;
+        
+        if let Ok(entries) = fs::read_dir(eng_dir) {
+            for entry in entries.flatten() {
+                let src = entry.path();
+                if src.is_file() {
+                    let dst = backup_dir.join(entry.file_name());
+                    fs::copy(&src, &dst)
+                        .map_err(|e| format!("Errore backup {}: {}", src.display(), e))?;
+                }
+            }
+        }
+    }
+    
+    println!("[GM-JN] Patching engLanguage/ in {}", lang_dir.display());
+    
+    // Re-walk .jn files in same order as extract_jn_strings
+    let mut entries = fs::read_dir(eng_dir)
+        .map_err(|e| format!("Errore lettura engLanguage/: {}", e))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .collect::<Vec<_>>();
+    entries.sort();
+    
+    let mut global_index = 0usize;
+    let mut patched_count = 0usize;
+    
+    for path in &entries {
+        if path.extension().is_none_or(|ext| ext != "jn") { continue; }
+        let filename = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+        
+        // Read from backup (original) to avoid re-patching already patched files
+        let backup_file = backup_dir.join(&filename);
+        let content = if backup_file.exists() {
+            fs::read_to_string(&backup_file)
+                .map_err(|e| format!("Errore lettura backup {}: {}", filename, e))?
+        } else {
+            fs::read_to_string(path)
+                .map_err(|e| format!("Errore lettura {}: {}", filename, e))?
+        };
+        
+        let mut output_lines = Vec::new();
+        
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                output_lines.push(String::new());
+                continue;
+            }
+            
+            // Parse: "English text|Japanese text"
+            let (english_part, jp_part) = if let Some(pipe_pos) = trimmed.find('|') {
+                (&trimmed[..pipe_pos], Some(&trimmed[pipe_pos + 1..]))
+            } else {
+                (trimmed, None)
+            };
+            
+            if english_part.is_empty() {
+                output_lines.push(trimmed.to_string());
+                global_index += 1;
+                continue;
+            }
+            
+            // Check if we have a translation for this index
+            if let Some(translated) = translations.get(&global_index) {
+                if let Some(jp) = jp_part {
+                    output_lines.push(format!("{}|{}", translated, jp));
+                } else {
+                    output_lines.push(translated.clone());
+                }
+                patched_count += 1;
+            } else {
+                // No translation — copy original
+                output_lines.push(trimmed.to_string());
+            }
+            
+            global_index += 1;
+        }
+        
+        // Overwrite engLanguage/ file directly (CRLF line endings to match original)
+        fs::write(path, output_lines.join("\r\n"))
+            .map_err(|e| format!("Errore scrittura {}: {}", filename, e))?;
+    }
+    
+    let file_count = entries.iter().filter(|p| p.extension().is_some_and(|ext| ext == "jn")).count();
+    println!("[GM-JN] engLanguage/ patchata: {} stringhe in {} file", patched_count, file_count);
+    
+    Ok(GmPatchResult {
+        success: true,
+        patched_count,
+        backup_path: backup_dir.to_string_lossy().to_string(),
+        message: format!("{} stringhe tradotte in engLanguage/ (backup in engLanguage.bak/)", patched_count),
+        // I .jn sono file di testo: le stringhe possono crescere liberamente.
+        truncated: Vec::new(),
+    })
+}
+
+/// Patch a YYC-compiled EXE by replacing strings at their exact byte offsets
+fn patch_exe(
+    game_path: &str,
+    translations: &HashMap<usize, String>,
+) -> Result<GmPatchResult, String> {
+    let exe_path = find_game_exe(game_path)
+        .ok_or_else(|| "EXE del gioco non trovato".to_string())?;
+    
+    println!("[GM-YYC] Patching EXE: {}", exe_path.display());
+    
+    // Backup EXE
+    let backup_path = exe_path.with_extension("exe.bak");
+    if !backup_path.exists() {
+        fs::copy(&exe_path, &backup_path)
+            .map_err(|e| format!("Errore backup EXE: {}", e))?;
+        println!("[GM-YYC] Backup EXE creato: {}", backup_path.display());
+    }
+    
+    // Read EXE
+    let mut exe_data = fs::read(&exe_path)
+        .map_err(|e| format!("Errore lettura EXE: {}", e))?;
+    
+    // Re-extract strings to get offsets
+    let all_strings = extract_exe_strings(&exe_data, 15);
+    
+    let mut patched_count = 0;
+    let mut truncated: Vec<GmTruncatedString> = Vec::new();
+
+    for (idx, translated) in translations.iter() {
+        // Find the string by index
+        if let Some(s) = all_strings.iter().find(|s| s.index == *idx) {
+            let offset = s.data_offset as usize;
+            let original_len = s.length; // byte length in EXE
+            let trans_bytes = translated.as_bytes();
+
+            // Same-length replacement: pad with spaces or truncate
+            let end = offset + original_len;
+            if end > exe_data.len() { continue; }
+
+            // Write translated bytes (truncate if longer)
+            let mut write_len = trans_bytes.len().min(original_len);
+            // Non tagliare a meta' di un carattere multibyte
+            while write_len > 0 && !translated.is_char_boundary(write_len) {
+                write_len -= 1;
+            }
+            if write_len < trans_bytes.len() {
+                truncated.push(GmTruncatedString {
+                    index: *idx,
+                    original: s.original.clone(),
+                    translated: translated.clone(),
+                    written: translated[..write_len].to_string(),
+                    available_bytes: original_len,
+                    needed_bytes: trans_bytes.len(),
+                });
+            }
+            exe_data[offset..offset + write_len].copy_from_slice(&trans_bytes[..write_len]);
+
+            // Pad remaining with spaces (0x20) to keep same length
+            if write_len < original_len {
+                for b in &mut exe_data[offset + write_len..end] {
+                    *b = 0x20; // space padding
+                }
+            }
+            
+            patched_count += 1;
+        }
+    }
+    
+    // Write patched EXE
+    fs::write(&exe_path, &exe_data)
+        .map_err(|e| format!("Errore scrittura EXE: {}", e))?;
+    
+    println!(
+        "[GM-YYC] Patch EXE completata: {} stringhe ({} troncate)",
+        patched_count,
+        truncated.len()
+    );
+
+    let message = if truncated.is_empty() {
+        format!("{} stringhe tradotte nell'EXE (same-length)", patched_count)
+    } else {
+        format!(
+            "{} stringhe tradotte nell'EXE (same-length) — {} troncate per mancanza di spazio",
+            patched_count,
+            truncated.len()
+        )
+    };
+
+    Ok(GmPatchResult {
+        success: true,
+        patched_count,
+        backup_path: backup_path.to_string_lossy().to_string(),
+        message,
+        truncated,
+    })
+}
+
+/// Patch data.win STRG chunk (standard non-YYC games)
+fn patch_data_win(
+    data: &[u8],
+    data_win_path: &Path,
+    strg: &(String, u32, u64),
+    all_strings: &[GmString],
+    translations: &HashMap<usize, String>,
+) -> Result<GmPatchResult, String> {
+    // Backup
+    let backup_path = data_win_path.with_extension("win.bak");
+    if !backup_path.exists() {
+        fs::copy(data_win_path, &backup_path)
+            .map_err(|e| format!("Errore backup: {}", e))?;
+        println!("[GM] Backup creato: {}", backup_path.display());
+    }
+    
+    let strg_chunk_header_offset = strg.2 as usize - 8;
+    let strg_data_offset = strg.2 as usize;
+    let old_strg_size = strg.1 as usize;
+    let count = all_strings.len();
+    
+    // Build owned translations array
+    let mut owned_translations: Vec<Option<String>> = vec![None; count];
+    for s in all_strings {
+        if let Some(translated) = translations.get(&s.index) {
+            if s.index < count {
+                owned_translations[s.index] = Some(translated.clone());
+            }
+        }
+    }
+    
+    // Always use same-size rebuild for safety
+    rebuild_same_size(
+        data, all_strings, &owned_translations,
+        strg_chunk_header_offset, strg_data_offset, old_strg_size,
+        data_win_path, &backup_path
+    )
+}
+
+/// Rebuild STRG chunk keeping the same total size by padding/truncating strings
+fn rebuild_same_size(
+    data: &[u8],
+    all_strings: &[GmString],
+    translations: &[Option<String>],
+    _strg_chunk_header_offset: usize,
+    strg_data_offset: usize,
+    old_strg_size: usize,
+    data_win_path: &Path,
+    backup_path: &Path,
+) -> Result<GmPatchResult, String> {
+    println!("[GM] Using same-size rebuild strategy (safer)");
+    
+    let count = all_strings.len();
+    let table_size = 4 + count * 4;
+    let string_data_abs_base = (strg_data_offset + table_size) as u32;
+    let available_data_space = old_strg_size - table_size;
+    
+    // Build string data with exact-fit: pad short strings, truncate long ones
+    let mut string_data_buf: Vec<u8> = Vec::with_capacity(available_data_space);
+    let mut new_pointers: Vec<u32> = Vec::with_capacity(count);
+    let mut patched_count = 0;
+    let mut truncated: Vec<GmTruncatedString> = Vec::new();
+
+    for (i, s) in all_strings.iter().enumerate() {
+        let is_translated = translations[i].is_some();
+        let text = if let Some(ref t) = translations[i] {
+            patched_count += 1;
+            t.as_str()
+        } else {
+            s.original.as_str()
+        };
+
+        let text_bytes = text.as_bytes();
+        let _original_entry_size = s.length + 4 + 1; // u32 len + chars + null
+        
+        // Calculate how much space this entry had originally
+        let next_data_offset = if i + 1 < all_strings.len() {
+            all_strings[i + 1].data_offset as usize - strg_data_offset - table_size
+        } else {
+            available_data_space
+        };
+        let entry_space = next_data_offset - string_data_buf.len();
+        
+        // Minimum: 4 (len) + 1 (null) = 5
+        if entry_space < 5 {
+            // Nessuno spazio: la stringa viene azzerata. Se era tradotta e' una
+            // perdita totale, va segnalata.
+            if is_translated {
+                truncated.push(GmTruncatedString {
+                    index: s.index,
+                    original: s.original.clone(),
+                    translated: text.to_string(),
+                    written: String::new(),
+                    available_bytes: 0,
+                    needed_bytes: text.len(),
+                });
+            }
+            // No space, write minimal
+            new_pointers.push(string_data_abs_base + string_data_buf.len() as u32);
+            string_data_buf.extend_from_slice(&0u32.to_le_bytes());
+            string_data_buf.push(0);
+            // Pad remaining
+            while string_data_buf.len() < next_data_offset {
+                string_data_buf.push(0);
+            }
+            continue;
+        }
+        
+        let max_text_len = entry_space - 5; // space for len prefix + null
+        let actual_text = if text_bytes.len() > max_text_len {
+            // Truncate at valid UTF-8 boundary
+            let mut end = max_text_len;
+            while end > 0 && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            // Solo le traduzioni contano come taglio: se a non entrare e' un
+            // originale, il file era gia' cosi' e non c'e' nulla da segnalare.
+            if is_translated {
+                truncated.push(GmTruncatedString {
+                    index: s.index,
+                    original: s.original.clone(),
+                    translated: text.to_string(),
+                    written: text[..end].to_string(),
+                    available_bytes: max_text_len,
+                    needed_bytes: text_bytes.len(),
+                });
+            }
+            &text_bytes[..end]
+        } else {
+            text_bytes
+        };
+
+        new_pointers.push(string_data_abs_base + string_data_buf.len() as u32);
+        string_data_buf.extend_from_slice(&(actual_text.len() as u32).to_le_bytes());
+        string_data_buf.extend_from_slice(actual_text);
+        string_data_buf.push(0);
+        
+        // Pad to fill original space
+        while string_data_buf.len() < next_data_offset {
+            string_data_buf.push(0);
+        }
+    }
+    
+    // Ensure exact size
+    string_data_buf.resize(available_data_space, 0);
+    
+    // Build new STRG chunk
+    let mut new_strg: Vec<u8> = Vec::with_capacity(old_strg_size);
+    new_strg.extend_from_slice(&(count as u32).to_le_bytes());
+    for ptr in &new_pointers {
+        new_strg.extend_from_slice(&ptr.to_le_bytes());
+    }
+    new_strg.extend_from_slice(&string_data_buf);
+    new_strg.resize(old_strg_size, 0);
+    
+    // Patch directly into file copy
+    let mut new_file = data.to_vec();
+    let strg_data_start = strg_data_offset;
+    let strg_data_end = strg_data_start + old_strg_size;
+    
+    if strg_data_end <= new_file.len() && new_strg.len() == old_strg_size {
+        new_file[strg_data_start..strg_data_end].copy_from_slice(&new_strg);
+    } else {
+        return Err("Errore: dimensioni STRG non corrispondono".to_string());
+    }
+    
+    fs::write(data_win_path, &new_file)
+        .map_err(|e| format!("Errore scrittura: {}", e))?;
+    
+    println!(
+        "[GM] Same-size patch completata: {} stringhe ({} troncate)",
+        patched_count,
+        truncated.len()
+    );
+
+    let message = if truncated.is_empty() {
+        format!("{} stringhe tradotte (same-size mode)", patched_count)
+    } else {
+        format!(
+            "{} stringhe tradotte (same-size mode) — {} troncate: non entravano nello spazio dell'originale",
+            patched_count,
+            truncated.len()
+        )
+    };
+
+    Ok(GmPatchResult {
+        success: true,
+        patched_count,
+        backup_path: backup_path.to_string_lossy().to_string(),
+        message,
+        truncated,
+    })
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn gm_restore_backup(game_path: String) -> Result<String, String> {
+    let mut restored = Vec::new();
+    
+    // Try restoring data.win backup
+    if let Some(data_win_path) = find_data_win(&game_path) {
+        let backup_path = data_win_path.with_extension("win.bak");
+        if backup_path.exists() {
+            fs::copy(&backup_path, &data_win_path)
+                .map_err(|e| format!("Errore ripristino data.win: {}", e))?;
+            println!("[GM] data.win backup ripristinato: {}", data_win_path.display());
+            restored.push("data.win");
+        }
+    }
+    
+    // Try restoring EXE backup (YYC games)
+    if let Some(exe_path) = find_game_exe(&game_path) {
+        let backup_path = exe_path.with_extension("exe.bak");
+        if backup_path.exists() {
+            fs::copy(&backup_path, &exe_path)
+                .map_err(|e| format!("Errore ripristino EXE: {}", e))?;
+            println!("[GM] EXE backup ripristinato: {}", exe_path.display());
+            restored.push("EXE");
+        }
+    }
+    
+    // Ripristino dei lang/*.json (Deltarune e simili): ogni file giapponese ha il
+    // suo .bak accanto, scritto una sola volta prima della prima patch.
+    if let Some((_lang_dir, pairs)) = find_json_lang_dir(&game_path) {
+        for pair in &pairs {
+            let backup = pair.target.with_extension("json.bak");
+            if backup.exists() {
+                if let Err(e) = fs::copy(&backup, &pair.target) {
+                    println!("[GM-JSON] Ripristino fallito per {}: {}", pair.target.display(), e);
+                } else {
+                    restored.push("lang JSON");
+                }
+            }
+        }
+    }
+
+    // Try restoring engLanguage.bak/ (language file games)
+    if let Some((_lang_dir, eng_dir)) = find_language_dir(&game_path) {
+        let backup_dir = eng_dir.parent().unwrap_or(Path::new(".")).join("engLanguage.bak");
+        if backup_dir.exists() {
+            if let Ok(entries) = fs::read_dir(&backup_dir) {
+                for entry in entries.flatten() {
+                    let src = entry.path();
+                    if src.is_file() {
+                        let dst = eng_dir.join(entry.file_name());
+                        fs::copy(&src, &dst)
+                            .map_err(|e| format!("Errore ripristino {}: {}", src.display(), e))?;
+                    }
+                }
+            }
+            println!("[GM] engLanguage/ ripristinata da backup");
+            restored.push("engLanguage");
+        }
+    }
+    
+    if restored.is_empty() {
+        return Err("Nessun backup trovato".to_string());
+    }
+    
+    Ok(format!("Backup ripristinato: {}", restored.join(" + ")))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn gm_search_strings(
+    game_path: String,
+    query: String,
+    only_translatable: Option<bool>,
+) -> Result<Vec<GmString>, String> {
+    // ── Priority 0: lang/*.json · Priority 1: language/*.jn ──
+    let strings = if let Some((_lang_dir, pairs)) = find_json_lang_dir(&game_path) {
+        extract_json_lang_strings(&pairs)
+    } else if let Some((_lang_dir, eng_dir)) = find_language_dir(&game_path) {
+        extract_jn_strings(&eng_dir)
+    } else {
+        // ── Priority 2/3: STRG or EXE ──
+        let data_win_path = find_data_win(&game_path)
+            .ok_or_else(|| "data.win non trovato".to_string())?;
+        let data = fs::read(&data_win_path)
+            .map_err(|e| format!("Errore lettura: {}", e))?;
+        let chunks = parse_chunks(&data);
+        let strg = chunks.iter().find(|(name, _, _)| name == "STRG")
+            .ok_or_else(|| "Chunk STRG non trovato".to_string())?;
+        let strg_strings = extract_strings(&data, strg.2, strg.1);
+        let strg_translatable = strg_strings.iter().filter(|s| s.is_translatable).count();
+        if strg_translatable < 50 {
+            if let Some(exe_path) = find_game_exe(&game_path) {
+                let exe_data = fs::read(&exe_path)
+                    .map_err(|e| format!("Errore lettura EXE: {}", e))?;
+                extract_exe_strings(&exe_data, 15)
+            } else {
+                strg_strings
+            }
+        } else {
+            strg_strings
+        }
+    };
+    
+    let query_lower = query.to_lowercase();
+    
+    let results: Vec<GmString> = strings.into_iter()
+        .filter(|s| {
+            if only_translatable.unwrap_or(true) && !s.is_translatable {
+                return false;
+            }
+            s.original.to_lowercase().contains(&query_lower)
+        })
+        .take(200)
+        .collect();
+    
+    Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Helper: build a minimal IFF/FORM file with given chunks ──
+    fn build_form(chunks: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (magic, data) in chunks {
+            body.extend_from_slice(*magic);
+            body.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            body.extend_from_slice(data);
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(b"FORM");
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        out.extend_from_slice(&body);
+        out
+    }
+
+    /// Build a STRG chunk body with the given strings.
+    /// Returns (full FORM file, strg_data_offset, strg_size).
+    fn build_strg_file(strings: &[&str]) -> (Vec<u8>, u64, u32) {
+        let count = strings.len();
+        let table_size = 4 + count * 4; // count + pointers
+
+        // The STRG chunk data offset inside FORM = 8 (FORM header) + 8 (STRG header)
+        let strg_data_abs = 16u32; // FORM(4)+size(4)+STRG(4)+size(4)
+
+        // First pass: compute string data
+        let mut string_data = Vec::new();
+        let mut offsets = Vec::new();
+        for s in strings {
+            let abs_offset = strg_data_abs + table_size as u32 + string_data.len() as u32;
+            offsets.push(abs_offset);
+            let bytes = s.as_bytes();
+            string_data.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            string_data.extend_from_slice(bytes);
+            string_data.push(0); // null terminator
+        }
+
+        // Build STRG body: count, pointers, string data
+        let mut strg_body = Vec::new();
+        strg_body.extend_from_slice(&(count as u32).to_le_bytes());
+        for off in &offsets {
+            strg_body.extend_from_slice(&off.to_le_bytes());
+        }
+        strg_body.extend_from_slice(&string_data);
+
+        let form = build_form(&[(b"STRG", &strg_body)]);
+        let strg_data_offset = 16u64; // after FORM(8) + STRG magic(4) + STRG size(4)
+        let strg_size = strg_body.len() as u32;
+        (form, strg_data_offset, strg_size)
+    }
+
+    // ═══════════════════════════════════════════════════════
+    // read_u32_le
+    // ═══════════════════════════════════════════════════════
+
+    #[test]
+    fn test_read_u32_le_basic() {
+        let data = [0x01, 0x00, 0x00, 0x00];
+        assert_eq!(read_u32_le(&data, 0), 1);
+    }
+
+    #[test]
+    fn test_read_u32_le_large_value() {
+        let data = [0xFF, 0xFF, 0xFF, 0xFF];
+        assert_eq!(read_u32_le(&data, 0), u32::MAX);
+    }
+
+    #[test]
+    fn test_read_u32_le_offset() {
+        let data = [0x00, 0x00, 0x78, 0x56, 0x34, 0x12];
+        assert_eq!(read_u32_le(&data, 2), 0x12345678);
+    }
+
+    #[test]
+    fn test_read_u32_le_out_of_bounds() {
+        let data = [0x01, 0x02];
+        assert_eq!(read_u32_le(&data, 0), 0); // returns 0 when out of bounds
+    }
+
+    #[test]
+    fn test_read_u32_le_empty() {
+        let data: [u8; 0] = [];
+        assert_eq!(read_u32_le(&data, 0), 0);
+    }
+
+    // ═══════════════════════════════════════════════════════
+    // read_gm_string
+    // ═══════════════════════════════════════════════════════
+
+    #[test]
+    fn test_read_gm_string_basic() {
+        // Format: 4-byte length prefix, then chars, then null
+        let mut data = Vec::new();
+        let text = b"Hello";
+        data.extend_from_slice(&(text.len() as u32).to_le_bytes());
+        data.extend_from_slice(text);
+        data.push(0);
+        assert_eq!(read_gm_string(&data, 0), "Hello");
+    }
+
+    #[test]
+    fn test_read_gm_string_empty_string() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.push(0);
+        assert_eq!(read_gm_string(&data, 0), "");
+    }
+
+    #[test]
+    fn test_read_gm_string_offset_beyond_data() {
+        let data = [0x00; 4];
+        assert_eq!(read_gm_string(&data, 100), "");
+    }
+
+    #[test]
+    fn test_read_gm_string_at_nonzero_offset() {
+        let mut data = vec![0xAA, 0xBB]; // garbage prefix
+        let text = b"Test";
+        data.extend_from_slice(&(text.len() as u32).to_le_bytes());
+        data.extend_from_slice(text);
+        data.push(0);
+        assert_eq!(read_gm_string(&data, 2), "Test");
+    }
+
+    #[test]
+    fn test_read_gm_string_length_exceeds_data() {
+        // Length says 100 but only 3 bytes available
+        let mut data = Vec::new();
+        data.extend_from_slice(&100u32.to_le_bytes());
+        data.extend_from_slice(b"abc");
+        // Should return "abc" (clamped to data.len())
+        assert_eq!(read_gm_string(&data, 0), "abc");
+    }
+
+    #[test]
+    fn test_read_gm_string_invalid_utf8_lossy() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.push(0xFF);
+        data.push(0xFE);
+        data.push(b'A');
+        data.push(0);
+        let result = read_gm_string(&data, 0);
+        // Should decode non-UTF-8 bytes via encoding detection and not panic
+        assert!(result.contains('A'));
+    }
+
+    // ═══════════════════════════════════════════════════════
+    // detect_version
+    // ═══════════════════════════════════════════════════════
+
+    #[test]
+    fn test_detect_version_studio_23_seqn() {
+        let chunks = vec!["GEN8".to_string(), "SEQN".to_string(), "STRG".to_string()];
+        assert_eq!(detect_version(&chunks), "Studio 2.3+");
+    }
+
+    #[test]
+    fn test_detect_version_studio_23_feds() {
+        let chunks = vec!["FEDS".to_string()];
+        assert_eq!(detect_version(&chunks), "Studio 2.3+");
+    }
+
+    #[test]
+    fn test_detect_version_studio_2x() {
+        let chunks = vec!["GEN8".to_string(), "TGIN".to_string(), "STRG".to_string()];
+        assert_eq!(detect_version(&chunks), "Studio 2.x");
+    }
+
+    #[test]
+    fn test_detect_version_studio_1x() {
+        let chunks = vec!["GEN8".to_string(), "STRG".to_string()];
+        assert_eq!(detect_version(&chunks), "Studio 1.x");
+    }
+
+    #[test]
+    fn test_detect_version_empty_chunks() {
+        let chunks: Vec<String> = vec![];
+        assert_eq!(detect_version(&chunks), "Studio 1.x");
+    }
+
+    // ═══════════════════════════════════════════════════════
+    // is_translatable
+    // ═══════════════════════════════════════════════════════
+
+    #[test]
+    fn test_is_translatable_real_text_with_spaces() {
+        assert!(is_translatable("Hello world, this is a test"));
+        assert!(is_translatable("Choose your character"));
+        assert!(is_translatable("FRESH MEAT - gain a mysterious meat"));
+    }
+
+    #[test]
+    fn test_is_translatable_single_words_are_excluded() {
+        // Regression for the 1.14.0/1.15.0 "patch success → boot failure"
+        // pattern: single words in STRG are indistinguishable from load-bearing
+        // GML literals (measured: 6,087 lowercase literals on Deltarune demo).
+        assert!(!is_translatable("Yes"));
+        assert!(!is_translatable("Cancel"));
+        assert!(!is_translatable("STAMINA"));
+        assert!(!is_translatable("actcon"));
+        assert!(!is_translatable("abletotarget"));
+        assert!(!is_translatable("idle"));
+    }
+
+    #[test]
+    fn test_is_translatable_empty_and_short() {
+        assert!(!is_translatable(""));
+        assert!(!is_translatable("ab"));
+        assert!(!is_translatable("  "));
+    }
+
+    #[test]
+    fn test_is_translatable_pure_numbers() {
+        assert!(!is_translatable("12345"));
+        assert!(!is_translatable("3.14"));
+        assert!(!is_translatable("-42"));
+    }
+
+    #[test]
+    fn test_is_translatable_file_paths() {
+        assert!(!is_translatable("sprites/player/idle.png"));
+        assert!(!is_translatable("sounds\\explosion.wav"));
+    }
+
+    #[test]
+    fn test_is_translatable_file_extensions() {
+        assert!(!is_translatable("music.ogg"));
+        assert!(!is_translatable("data.json"));
+        assert!(!is_translatable("config.ini"));
+        assert!(!is_translatable("script.gml"));
+        assert!(!is_translatable("project.yyp"));
+    }
+
+    #[test]
+    fn test_is_translatable_hex_colors() {
+        assert!(!is_translatable("#FF0000"));
+        assert!(!is_translatable("#abc"));
+        assert!(!is_translatable("#12345678"));
+    }
+
+    #[test]
+    fn test_is_translatable_no_letters() {
+        assert!(!is_translatable("---"));
+        assert!(!is_translatable("12345!!"));
+    }
+
+    #[test]
+    fn test_is_translatable_very_long_string() {
+        let long = "a ".repeat(3000);
+        assert!(!is_translatable(&long));
+    }
+
+    #[test]
+    fn test_is_translatable_gml_code() {
+        assert!(!is_translatable("var x = 10;"));
+        assert!(!is_translatable("function(arg)"));
+        assert!(!is_translatable("if (x > 0) {}"));
+        assert!(!is_translatable("a && b"));
+        assert!(!is_translatable("a || b"));
+        assert!(!is_translatable("a != b"));
+        assert!(!is_translatable("global.player_hp"));
+        assert!(!is_translatable("self.name"));
+    }
+
+    #[test]
+    fn test_is_translatable_gm_prefixes() {
+        assert!(!is_translatable("gml_Script_something"));
+        assert!(!is_translatable("scr_player_attack"));
+        assert!(!is_translatable("obj_player"));
+        assert!(!is_translatable("spr_hero_idle"));
+        assert!(!is_translatable("snd_explosion"));
+        assert!(!is_translatable("rm_title"));
+        assert!(!is_translatable("bg_sky"));
+        assert!(!is_translatable("fnt_main"));
+        assert!(!is_translatable("audiogroup_default"));
+    }
+
+    #[test]
+    fn test_is_translatable_internal_prefixes() {
+        assert!(!is_translatable("@@built_in"));
+        assert!(!is_translatable("$$global"));
+    }
+
+    #[test]
+    fn test_is_translatable_snake_case_no_spaces() {
+        assert!(!is_translatable("theme_combat"));
+        assert!(!is_translatable("select_god"));
+        assert!(!is_translatable("some_identifier_name"));
+    }
+
+    #[test]
+    fn test_is_translatable_camel_case() {
+        assert!(!is_translatable("camelCaseIdentifier"));
+        assert!(!is_translatable("playerHealth"));
+    }
+
+    #[test]
+    fn test_is_translatable_short_dot_extension() {
+        assert!(!is_translatable(".gml"));
+        assert!(!is_translatable(".txt"));
+    }
+
+    #[test]
+    fn test_is_translatable_identifier_list_with_spaces() {
+        // Space-separated identifiers that all contain underscores
+        assert!(!is_translatable("theme_combat select_god combat_win"));
+    }
+
+    // ═══════════════════════════════════════════════════════
+    // parse_chunks
+    // ═══════════════════════════════════════════════════════
+
+    #[test]
+    fn test_parse_chunks_empty() {
+        assert!(parse_chunks(&[]).is_empty());
+    }
+
+    #[test]
+    fn test_parse_chunks_no_form_header() {
+        let data = b"NOTFORMdata";
+        assert!(parse_chunks(data).is_empty());
+    }
+
+    #[test]
+    fn test_parse_chunks_too_short() {
+        let data = b"FORM";
+        assert!(parse_chunks(data).is_empty());
+    }
+
+    #[test]
+    fn test_parse_chunks_single_chunk() {
+        let chunk_data = b"hello";
+        let form = build_form(&[(b"GEN8", chunk_data)]);
+        let chunks = parse_chunks(&form);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].0, "GEN8");
+        assert_eq!(chunks[0].1, 5); // size of "hello"
+    }
+
+    #[test]
+    fn test_parse_chunks_multiple_chunks() {
+        let form = build_form(&[
+            (b"GEN8", &[0; 4]),
+            (b"STRG", &[0; 8]),
+            (b"TXTR", &[0; 2]),
+        ]);
+        let chunks = parse_chunks(&form);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].0, "GEN8");
+        assert_eq!(chunks[1].0, "STRG");
+        assert_eq!(chunks[2].0, "TXTR");
+        assert_eq!(chunks[0].1, 4);
+        assert_eq!(chunks[1].1, 8);
+        assert_eq!(chunks[2].1, 2);
+    }
+
+    #[test]
+    fn test_parse_chunks_data_offsets_correct() {
+        let form = build_form(&[
+            (b"GEN8", &[0; 4]),
+            (b"STRG", &[0; 8]),
+        ]);
+        let chunks = parse_chunks(&form);
+        // First chunk data starts at offset 16 (FORM:4 + size:4 + GEN8:4 + size:4)
+        assert_eq!(chunks[0].2, 16);
+        // Second chunk data starts at 16 + 4 (GEN8 data) + 8 (STRG header)
+        assert_eq!(chunks[1].2, 16 + 4 + 8);
+    }
+
+    // ═══════════════════════════════════════════════════════
+    // extract_strings
+    // ═══════════════════════════════════════════════════════
+
+    #[test]
+    fn test_extract_strings_basic() {
+        let (form, offset, size) = build_strg_file(&["Hello", "World"]);
+        let strings = extract_strings(&form, offset, size);
+        assert_eq!(strings.len(), 2);
+        assert_eq!(strings[0].original, "Hello");
+        assert_eq!(strings[1].original, "World");
+        assert_eq!(strings[0].index, 0);
+        assert_eq!(strings[1].index, 1);
+    }
+
+    #[test]
+    fn test_extract_strings_empty_strg() {
+        // STRG with count=0
+        let strg_body = 0u32.to_le_bytes().to_vec();
+        let form = build_form(&[(b"STRG", &strg_body)]);
+        let strings = extract_strings(&form, 16, strg_body.len() as u32);
+        assert!(strings.is_empty());
+    }
+
+    #[test]
+    fn test_extract_strings_offset_beyond_data() {
+        let data = [0u8; 16];
+        let strings = extract_strings(&data, 1000, 100);
+        assert!(strings.is_empty());
+    }
+
+    #[test]
+    fn test_extract_strings_preserves_length() {
+        let (form, offset, size) = build_strg_file(&["abc"]);
+        let strings = extract_strings(&form, offset, size);
+        assert_eq!(strings[0].length, 3);
+    }
+
+    #[test]
+    fn test_extract_strings_translatable_flag() {
+        let (form, offset, size) = build_strg_file(&[
+            "Hello world this is text",   // translatable (has spaces, real words)
+            "spr_player_idle",             // not translatable (gm prefix + snake_case)
+        ]);
+        let strings = extract_strings(&form, offset, size);
+        assert!(strings[0].is_translatable);
+        assert!(!strings[1].is_translatable);
+    }
+
+    // ═══════════════════════════════════════════════════════
+    // is_translatable_exe_string
+    // ═══════════════════════════════════════════════════════
+
+    #[test]
+    fn test_exe_string_real_game_text() {
+        assert!(is_translatable_exe_string("Welcome to the dungeon adventurer"));
+        assert!(is_translatable_exe_string("Press any key to continue playing"));
+    }
+
+    #[test]
+    fn test_exe_string_too_short() {
+        assert!(!is_translatable_exe_string("short"));
+        assert!(!is_translatable_exe_string("ab cd"));
+    }
+
+    #[test]
+    fn test_exe_string_no_spaces() {
+        assert!(!is_translatable_exe_string("NoSpacesHereAtAll"));
+    }
+
+    #[test]
+    fn test_exe_string_no_letters() {
+        assert!(!is_translatable_exe_string("123 456 789 000"));
+    }
+
+    #[test]
+    fn test_exe_string_x86_gibberish() {
+        // Typical x86 decoded noise
+        assert!(!is_translatable_exe_string("L$ UVWATAUAVAWH"));
+        assert!(!is_translatable_exe_string("D$(9D$ }HcD$ H"));
+    }
+
+    #[test]
+    fn test_exe_string_format_strings() {
+        assert!(!is_translatable_exe_string("Error code: %d in module %s"));
+        assert!(!is_translatable_exe_string("Value: %f percent: %i"));
+    }
+
+    #[test]
+    fn test_exe_string_dos_program() {
+        assert!(!is_translatable_exe_string("This program cannot be run in dos mode"));
+    }
+
+    #[test]
+    fn test_exe_string_shader_code() {
+        assert!(!is_translatable_exe_string("#version 330 core output something"));
+        assert!(!is_translatable_exe_string("precision mediump float something else"));
+        assert!(!is_translatable_exe_string("uniform sampler2D some texture thing"));
+    }
+
+    #[test]
+    fn test_exe_string_dll_system() {
+        assert!(!is_translatable_exe_string("loading module kernel32.dll now please"));
+        assert!(!is_translatable_exe_string("something about user32.dll loading"));
+    }
+
+    #[test]
+    fn test_exe_string_gml_code() {
+        assert!(!is_translatable_exe_string("global.player with some data attached"));
+        assert!(!is_translatable_exe_string("var something = value; more stuff"));
+    }
+
+    #[test]
+    fn test_exe_string_runtime_errors() {
+        assert!(!is_translatable_exe_string("index out of bounds for array access"));
+        assert!(!is_translatable_exe_string("fatal error occurred during execution of something"));
+        assert!(!is_translatable_exe_string("stack overflow detected in recursive function"));
+        assert!(!is_translatable_exe_string("division by zero attempted in calculation"));
+    }
+
+    #[test]
+    fn test_exe_string_debug_messages() {
+        assert!(!is_translatable_exe_string("[debug] something happened here now"));
+        assert!(!is_translatable_exe_string("[error] something failed over here"));
+    }
+
+    #[test]
+    fn test_exe_string_ds_map() {
+        assert!(!is_translatable_exe_string("ds_map entry does not exist here"));
+    }
+
+    // ═══════════════════════════════════════════════════════
+    // extract_exe_strings
+    // ═══════════════════════════════════════════════════════
+
+    #[test]
+    fn test_extract_exe_strings_finds_ascii_runs() {
+        // Put some readable text in binary noise
+        let mut data = vec![0x00; 10];
+        data.extend_from_slice(b"This is readable text in binary");
+        data.extend_from_slice(&[0x00; 10]);
+        data.extend_from_slice(b"Another readable string here");
+        data.extend_from_slice(&[0x00; 10]);
+
+        let strings = extract_exe_strings(&data, 8);
+        // Should find at least the two ASCII runs
+        assert!(strings.len() >= 2);
+        assert!(strings.iter().any(|s| s.original.contains("This is readable")));
+        assert!(strings.iter().any(|s| s.original.contains("Another readable")));
+    }
+
+    #[test]
+    fn test_extract_exe_strings_respects_min_len() {
+        let mut data = vec![0x00; 5];
+        data.extend_from_slice(b"Hi"); // too short for min_len=8
+        data.extend_from_slice(&[0x00; 5]);
+        data.extend_from_slice(b"This is long enough text");
+        data.extend_from_slice(&[0x00; 5]);
+
+        let strings = extract_exe_strings(&data, 8);
+        assert!(strings.iter().all(|s| s.original.len() >= 8));
+    }
+
+    #[test]
+    fn test_extract_exe_strings_empty_data() {
+        let strings = extract_exe_strings(&[], 8);
+        assert!(strings.is_empty());
+    }
+
+    #[test]
+    fn test_extract_exe_strings_all_binary() {
+        let data = vec![0x00, 0x01, 0x02, 0xFF, 0xFE, 0x80];
+        let strings = extract_exe_strings(&data, 4);
+        assert!(strings.is_empty());
+    }
+
+    #[test]
+    fn test_extract_exe_strings_indexes_sequential() {
+        let mut data = vec![0x00; 5];
+        data.extend_from_slice(b"First string here now");
+        data.extend_from_slice(&[0x00; 5]);
+        data.extend_from_slice(b"Second string here now");
+        data.extend_from_slice(&[0x00; 5]);
+
+        let strings = extract_exe_strings(&data, 8);
+        for (i, s) in strings.iter().enumerate() {
+            assert_eq!(s.index, i);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════
+    // _write_u32_le
+    // ═══════════════════════════════════════════════════════
+
+    #[test]
+    fn test_write_u32_le_basic() {
+        let mut data = [0u8; 4];
+        _write_u32_le(&mut data, 0, 0x12345678);
+        assert_eq!(data, [0x78, 0x56, 0x34, 0x12]);
+    }
+
+    #[test]
+    fn test_write_u32_le_roundtrip() {
+        let mut data = [0u8; 8];
+        _write_u32_le(&mut data, 2, 42);
+        assert_eq!(read_u32_le(&data, 2), 42);
+    }
+
+    // ═══════════════════════════════════════════════════════
+    // Edge cases for is_translatable
+    // ═══════════════════════════════════════════════════════
+
+    #[test]
+    fn test_is_translatable_dot_prefix_short() {
+        assert!(!is_translatable(".png"));
+        assert!(!is_translatable(".csv"));
+    }
+
+    #[test]
+    fn test_is_translatable_whitespace_only() {
+        assert!(!is_translatable("   "));
+    }
+
+    #[test]
+    fn test_is_translatable_single_real_word() {
+        // Changed 06/08/2026: single words no longer pass, even real-looking
+        // ones — on the Deltarune demo data.win the same rule admitted 6,087
+        // lowercase GML literals and broke the boot (see the single-word
+        // comment in is_translatable).
+        assert!(!is_translatable("ATTACK"));
+        assert!(!is_translatable("Inventory"));
+    }
+
+    #[test]
+    fn test_is_translatable_known_combat_prefix() {
+        // These start with combat_ / select_ / theme_ etc - blocked even without camelCase/underscore
+        // Actually they contain underscores so blocked by snake_case rule
+        assert!(!is_translatable("combat_start"));
+        assert!(!is_translatable("select_hero"));
+        assert!(!is_translatable("theme_dark"));
+    }
+
+    #[test]
+    fn test_is_translatable_vk_prefix() {
+        assert!(!is_translatable("vk_enter"));
+        assert!(!is_translatable("mb_left"));
+        assert!(!is_translatable("buffer_grow"));
+    }
+
+    // ═══════════════════════════════════════════════════════
+    // Integration: full STRG roundtrip
+    // ═══════════════════════════════════════════════════════
+
+    #[test]
+    fn test_full_strg_roundtrip() {
+        let test_strings = &[
+            "Hello World",
+            "spr_player",
+            "This is translatable text here",
+            "obj_enemy_boss",
+            "42",
+        ];
+        let (form, offset, size) = build_strg_file(test_strings);
+
+        // Parse chunks
+        let chunks = parse_chunks(&form);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].0, "STRG");
+
+        // Extract strings
+        let strings = extract_strings(&form, offset, size);
+        assert_eq!(strings.len(), 5);
+        for (i, expected) in test_strings.iter().enumerate() {
+            assert_eq!(strings[i].original, *expected);
+        }
+
+        // Verify translatability
+        assert!(strings[0].is_translatable);  // "Hello World" — has space, real words
+        assert!(!strings[1].is_translatable); // "spr_player" — GM prefix
+        assert!(strings[2].is_translatable);  // "This is translatable text here"
+        assert!(!strings[3].is_translatable); // "obj_enemy_boss" — GM prefix
+        assert!(!strings[4].is_translatable); // "42" — too short / number
+    }
+
+    #[test]
+    fn test_parse_chunks_with_multiple_types() {
+        let form = build_form(&[
+            (b"GEN8", &[0; 4]),
+            (b"STRG", &[0; 4]),
+            (b"TGIN", &[0; 4]),
+            (b"SEQN", &[0; 4]),
+        ]);
+        let chunks = parse_chunks(&form);
+        let names: Vec<&str> = chunks.iter().map(|(n, _, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["GEN8", "STRG", "TGIN", "SEQN"]);
+        assert_eq!(detect_version(&names.iter().map(|s| s.to_string()).collect::<Vec<_>>()), "Studio 2.3+");
+    }
+
+    // ═══════════════════════════════════════════════════════
+    // Edge cases for extract_strings with malformed data
+    // ═══════════════════════════════════════════════════════
+
+    #[test]
+    fn test_extract_strings_count_exceeds_data() {
+        // STRG body claims 1000 strings but has no pointer data
+        let mut strg_body = Vec::new();
+        strg_body.extend_from_slice(&1000u32.to_le_bytes());
+        // Only 4 bytes of data — pointers will be out of bounds
+        let form = build_form(&[(b"STRG", &strg_body)]);
+        let strings = extract_strings(&form, 16, strg_body.len() as u32);
+        // Should not panic, just return what it can
+        assert!(strings.is_empty());
+    }
+
+    #[test]
+    fn test_extract_strings_pointer_beyond_file() {
+        // STRG with 1 string, but pointer points beyond file
+        let mut strg_body = Vec::new();
+        strg_body.extend_from_slice(&1u32.to_le_bytes()); // count = 1
+        strg_body.extend_from_slice(&0xFFFFFFFFu32.to_le_bytes()); // pointer way beyond
+        let form = build_form(&[(b"STRG", &strg_body)]);
+        let strings = extract_strings(&form, 16, strg_body.len() as u32);
+        // The string pointer is beyond data, so extract should skip it
+        // (read_gm_string returns empty for out-of-bounds offset)
+        // It may still push a GmString with empty original
+        for s in &strings {
+            assert_eq!(s.original, "");
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════
+    // is_translatable_exe_string - more edge cases
+    // ═══════════════════════════════════════════════════════
+
+    #[test]
+    fn test_exe_string_low_letter_ratio() {
+        // Mostly symbols/numbers with a few letters
+        assert!(!is_translatable_exe_string("123 456 ab 789 000 cd 111"));
+    }
+
+    #[test]
+    fn test_exe_string_save_file_pattern() {
+        assert!(!is_translatable_exe_string("save file location for player data backup"));
+    }
+
+    #[test]
+    fn test_exe_string_copyright_microsoft() {
+        assert!(!is_translatable_exe_string("copyright reserved microsoft corporation year"));
+    }
+
+    #[test]
+    fn test_exe_string_shader_register() {
+        assert!(!is_translatable_exe_string("register(b0) constant buffer data here"));
+    }
+
+    #[test]
+    fn test_exe_string_comment_prefix() {
+        assert!(!is_translatable_exe_string("// this is some comment text here now"));
+    }
+
+    // ── lang/*.json (Deltarune) ───────────────────────────────────────────
+    // I casi riproducono la struttura verificata sulla demo il 26/07/2026:
+    // lang_en_ch1.json + lang_ja_ch1.json accoppiati, lang_ja.json senza sorgente
+    // inglese (quel testo sta dentro data.win) e quindi da ignorare.
+
+    fn scrivi_lang(dir: &Path, nome: &str, json: &str) {
+        fs::create_dir_all(dir.join("lang")).unwrap();
+        fs::write(dir.join("lang").join(nome), json).unwrap();
+    }
+
+    #[test]
+    fn json_lang_accoppia_solo_i_capitoli_con_sorgente_inglese() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        scrivi_lang(root, "lang_en_ch1.json", r#"{"date":"1","A":"HELLO"}"#);
+        scrivi_lang(root, "lang_ja_ch1.json", r#"{"date":"1","A":"こんにちは"}"#);
+        // Chapter 2: solo giapponese, nessuna sorgente inglese su disco
+        scrivi_lang(root, "lang_ja.json", r#"{"date":"1","B":"やあ"}"#);
+
+        let (_dir, pairs) = find_json_lang_dir(root.to_str().unwrap()).expect("lang/ va rilevata");
+        assert_eq!(pairs.len(), 1, "solo il capitolo 1 ha la coppia en→ja");
+        assert!(pairs[0].source.ends_with("lang_en_ch1.json"));
+        assert!(pairs[0].target.ends_with("lang_ja_ch1.json"));
+    }
+
+    #[test]
+    fn json_lang_ignora_cartelle_senza_coppie() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        scrivi_lang(root, "lang_ja.json", r#"{"A":"やあ"}"#);
+        assert!(find_json_lang_dir(root.to_str().unwrap()).is_none());
+    }
+
+    #[test]
+    fn json_lang_conta_saltando_date_e_non_testo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // `date` è un timestamp del gioco; "^6 %" sono soli marcatori, senza testo
+        scrivi_lang(
+            root,
+            "lang_en_ch1.json",
+            r#"{"date":"1540902565549","A":"ARE YOU^6& THERE^6?","B":"^6 %","C":"EXCELLENT^4."}"#,
+        );
+        scrivi_lang(root, "lang_ja_ch1.json", r#"{"date":"1","A":"","B":"","C":""}"#);
+
+        let (_d, pairs) = find_json_lang_dir(root.to_str().unwrap()).unwrap();
+        let (total, files) = count_json_lang_strings(&pairs);
+        assert_eq!(files, 1);
+        assert_eq!(total, 2, "A e C sono testo, B è solo marcatori, date non conta");
+    }
+
+    #[test]
+    fn json_lang_non_scarta_i_dialoghi_coi_marcatori_da_codice() {
+        // Regressione 28/07/2026: `is_translatable` (filtro STRG) scartava i
+        // dialoghi Deltarune con `/` (aspetta input) e `&&` (doppio a capo):
+        // sulla demo vera il contatore diceva 1471 invece di 6121. In un file
+        // di lingua è tutto testo: si scarta solo ciò che non ha lettere.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        scrivi_lang(
+            root,
+            "lang_en_ch1.json",
+            r#"{"date":"1540902565549","A":"Welcome to the DARK WORLD./","B":"First line&&third line^6?","C":"* (You feel... global. Somehow.)","D":"^6&/%"}"#,
+        );
+        scrivi_lang(root, "lang_ja_ch1.json", r#"{"date":"1","A":"","B":"","C":"","D":""}"#);
+
+        let (_d, pairs) = find_json_lang_dir(root.to_str().unwrap()).unwrap();
+        let (total, _files) = count_json_lang_strings(&pairs);
+        assert_eq!(total, 3, "A, B e C sono dialoghi veri nonostante / && e 'global.'; D è soli marcatori");
+
+        let estratte = extract_json_lang_strings(&pairs);
+        let traducibili: Vec<&str> = estratte
+            .iter()
+            .filter(|s| s.is_translatable)
+            .map(|s| s.original.as_str())
+            .collect();
+        assert_eq!(traducibili.len(), 3);
+        assert!(traducibili.iter().any(|s| s.contains('/')), "il marcatore / non deve scartare il dialogo");
+        assert!(traducibili.iter().any(|s| s.contains("&&")), "il doppio a capo && non deve scartare il dialogo");
+    }
+
+    #[test]
+    fn json_lang_patch_conserva_il_giapponese_e_le_chiavi_solo_ja() {
+        // Regressione 28/07/2026: la patch ricostruiva il file ja dalle chiavi
+        // INGLESI — chiavi solo-giapponesi perse, voci non tradotte riempite
+        // col testo inglese. Ora la base sono le voci del file giapponese.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        scrivi_lang(
+            root,
+            "lang_en_ch1.json",
+            r#"{"date":"1","A":"Hello","B":"World"}"#,
+        );
+        scrivi_lang(
+            root,
+            "lang_ja_ch1.json",
+            r#"{"date":"1","A":"こんにちは","B":"せかい","SOLO_JA":"日本語だけ"}"#,
+        );
+
+        let (_d, pairs) = find_json_lang_dir(root.to_str().unwrap()).unwrap();
+        // Si traduce SOLO l'indice 0 ("A", ordine di lettura del sorgente).
+        let mut tr = HashMap::new();
+        tr.insert(0usize, "Привет".to_string());
+        let r = patch_json_lang_files(&pairs, &tr).unwrap();
+        assert_eq!(r.patched_count, 1);
+
+        let scritto = fs::read_to_string(root.join("lang").join("lang_ja_ch1.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&scritto).unwrap();
+        assert_eq!(v["A"], "Привет", "la voce tradotta va in russo");
+        assert_eq!(v["B"], "せかい", "la voce NON tradotta conserva il giapponese, non prende l'inglese");
+        assert_eq!(v["SOLO_JA"], "日本語だけ", "le chiavi solo-giapponesi non spariscono");
+        assert_eq!(v["date"], "1");
+    }
+
+    #[tokio::test]
+    async fn json_lang_rispetta_offset_e_limit() {
+        // Regressione 28/07/2026: il ramo JSON di gm_extract_strings applicava
+        // solo truncate(limit) IGNORANDO offset → ogni pagina erano le stesse
+        // prime N stringhe e "Traduci tutto" girava all'infinito (pagina mai
+        // vuota, tutto già tradotto, barra ferma a N/N).
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        scrivi_lang(
+            root,
+            "lang_en_ch1.json",
+            r#"{"date":"1","A":"Alpha","B":"Beta","C":"Gamma","D":"Delta","E":"Epsilon"}"#,
+        );
+        scrivi_lang(root, "lang_ja_ch1.json", r#"{"date":"1","A":"","B":"","C":"","D":"","E":""}"#);
+        let gp = root.to_str().unwrap().to_string();
+
+        let p0 = gm_extract_strings(gp.clone(), Some(true), Some(0), Some(2)).await.unwrap();
+        let p1 = gm_extract_strings(gp.clone(), Some(true), Some(2), Some(2)).await.unwrap();
+        assert_eq!(p0.len(), 2);
+        assert_eq!(p1.len(), 2);
+        assert_ne!(p0[0].original, p1[0].original, "pagine diverse devono dare stringhe diverse");
+
+        // Oltre la fine: pagina VUOTA, è la condizione d'uscita del ciclo UI.
+        let oltre = gm_extract_strings(gp, Some(true), Some(100), Some(2)).await.unwrap();
+        assert!(oltre.is_empty(), "offset oltre la fine deve dare pagina vuota, non le prime stringhe");
+    }
+
+    #[test]
+    fn json_lang_scrive_le_traduzioni_nel_file_giapponese() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        scrivi_lang(root, "lang_en_ch1.json", r#"{"date":"1","A":"HELLO","B":"BYE"}"#);
+        scrivi_lang(root, "lang_ja_ch1.json", r#"{"date":"1","A":"x","B":"y"}"#);
+
+        let (_d, pairs) = find_json_lang_dir(root.to_str().unwrap()).unwrap();
+        let mut tr = HashMap::new();
+        tr.insert(0usize, "ПРИВЕТ".to_string());
+
+        let res = patch_json_lang_files(&pairs, &tr).unwrap();
+        assert!(res.success);
+        assert_eq!(res.patched_count, 1);
+
+        let scritto: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(root.join("lang/lang_ja_ch1.json")).unwrap())
+                .unwrap();
+        assert_eq!(scritto["A"], "ПРИВЕТ", "la traduzione va nel file che il gioco carica");
+        // 28/07/2026: prima qui si pretendeva l'INGLESE ("BYE") — era il bug:
+        // il file ja veniva ricostruito dalle chiavi del file en. Senza
+        // traduzione deve restare il GIAPPONESE originale.
+        assert_eq!(scritto["B"], "y", "senza traduzione resta il giapponese originale");
+        assert_eq!(scritto["date"], "1", "date passa invariata");
+
+        // il backup dell'originale esiste e non viene sovrascritto da una seconda patch
+        let bak = root.join("lang/lang_ja_ch1.json.bak");
+        assert!(bak.exists(), "serve un backup prima di scrivere");
+        let orig: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&bak).unwrap()).unwrap();
+        assert_eq!(orig["A"], "x", "il backup conserva il giapponese originale");
+    }
+
+    #[test]
+    fn json_lang_tollera_il_bom() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        scrivi_lang(root, "lang_en_ch1.json", "\u{feff}{\"A\":\"HELLO\"}");
+        scrivi_lang(root, "lang_ja_ch1.json", "{\"A\":\"x\"}");
+        let (_d, pairs) = find_json_lang_dir(root.to_str().unwrap()).unwrap();
+        let letto = read_json_lang(&pairs[0].source).expect("il BOM non deve impedire il parse");
+        assert_eq!(letto.len(), 1);
+    }
+}

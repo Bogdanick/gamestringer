@@ -1,0 +1,319 @@
+'use client';
+
+import { invoke } from '@/lib/tauri-api';
+import type { ProfileResponse, UserProfile } from '@/types/profiles';
+import { safeSetItem, safeGetItem, safeRemoveItem } from '@/lib/safe-storage';
+import { clientLogger } from '@/lib/client-logger';
+
+export interface SessionData {
+  profileId: string;
+  profileName: string;
+  expiresAt: number;
+  lastActivity: number;
+}
+
+class SessionPersistence {
+  private static instance: SessionPersistence;
+  private sessionKey = 'gs_profile_session';
+  private activityKey = 'gs_last_activity';
+
+  static getInstance(): SessionPersistence {
+    if (!SessionPersistence.instance) {
+      SessionPersistence.instance = new SessionPersistence();
+    }
+    return SessionPersistence.instance;
+  }
+
+  // Save session data to localStorage (non-critical, sistema sessioni disabilitato)
+  saveSession(sessionData: SessionData): void {
+    try {
+      if (safeSetItem(this.sessionKey, sessionData)) {
+        this.updateLastActivity();
+      }
+    } catch {
+      // Ignora silenziosamente - il sistema sessioni è disabilitato
+    }
+  }
+
+  // Load session data from localStorage
+  loadSession(): SessionData | null {
+    const session = safeGetItem<SessionData>(this.sessionKey);
+    if (!session) return null;
+    
+    // Check if session is expired
+    if (Date.now() > session.expiresAt) {
+      this.clearSession();
+      return null;
+    }
+
+    return session;
+  }
+
+  // Clear session data
+  clearSession(): void {
+    safeRemoveItem(this.sessionKey);
+    safeRemoveItem(this.activityKey);
+  }
+
+  // Update last activity timestamp
+  updateLastActivity(): void {
+    safeSetItem(this.activityKey, Date.now());
+  }
+
+  // Get last activity timestamp
+  getLastActivity(): number | null {
+    return safeGetItem<number>(this.activityKey);
+  }
+
+  // Check if session should be renewed based on activity
+  shouldRenewSession(inactivityThreshold: number = 30 * 60 * 1000): boolean {
+    const lastActivity = this.getLastActivity();
+    if (!lastActivity) return false;
+
+    const timeSinceActivity = Date.now() - lastActivity;
+    return timeSinceActivity < inactivityThreshold;
+  }
+
+  // Auto-save session when profile changes
+  async syncWithBackend(): Promise<void> {
+    try {
+      const currentProfile = await invoke<ProfileResponse<UserProfile | null>>('get_current_profile');
+      
+      if (currentProfile?.success && currentProfile.data) {
+        const timeResponse = await invoke<ProfileResponse<number | null>>('get_session_time_remaining', {
+          timeoutSeconds: 1800 // 30 minuti - Tauri 2.x converte automaticamente in snake_case
+        });
+        const remaining = timeResponse?.success && typeof timeResponse.data === 'number' ? timeResponse.data : 0;
+        
+        const sessionData: SessionData = {
+          profileId: currentProfile.data.id,
+          profileName: currentProfile.data.name,
+          expiresAt: Date.now() + remaining,
+          lastActivity: Date.now()
+        };
+
+        this.saveSession(sessionData);
+      } else {
+        this.clearSession();
+      }
+    } catch (error: unknown) {
+      clientLogger.error(`Error syncing session with backend: ${String(error)}`, 'SESSION');
+    }
+  }
+
+  // Restore session on app startup con timeout e protezione
+  async restoreSession(): Promise<boolean> {
+    const session = this.loadSession();
+    if (!session) {
+      return false; // Nessuna session = avvio veloce
+    }
+
+    try {
+      // Timeout ridotto per startup veloce
+      const timeoutPromise = new Promise<never>((_, reject) => 
+        setTimeout(() => reject(new Error('Session restore timeout')), 1000)
+      );
+
+      const restorePromise = this.performRestore(session);
+      const result = await Promise.race([restorePromise, timeoutPromise]);
+      return result;
+      
+    } catch {
+      // Fallback silenzioso - non bloccare startup
+      this.clearSession();
+      return false;
+    }
+  }
+
+  private async performRestore(session: SessionData): Promise<boolean> {
+    try {
+      // Try to restore the session in the backend
+      const canAuthResp = await invoke<ProfileResponse<boolean>>('can_authenticate', { name: session.profileName });
+      if (!(canAuthResp?.success && canAuthResp.data)) {
+        clientLogger.debug(' Backend non può autenticare');
+        this.clearSession();
+        return false;
+      }
+
+      // Check if the session is still valid in the backend
+      const expiredResp = await invoke<ProfileResponse<boolean>>('is_session_expired', { timeoutSeconds: 1800 });
+      const isExpired = expiredResp?.success ? !!expiredResp.data : true;
+      if (isExpired) {
+        clientLogger.debug(' Session scaduta, tentativo rinnovo...');
+        
+        // Try to renew if recent activity
+        if (this.shouldRenewSession()) {
+          const renewedResp = await invoke<ProfileResponse<boolean>>('renew_session');
+          const renewed = renewedResp?.success && !!renewedResp.data;
+          if (renewed) {
+            clientLogger.debug('✅ Session rinnovata');
+            await this.syncWithBackend();
+            return true;
+          }
+        }
+        
+        clientLogger.debug('❌ Impossibile rinnovare session');
+        this.clearSession();
+        return false;
+      }
+
+      // Session is valid, sync with backend
+      clientLogger.debug('✅ Session valida, sync con backend...');
+      await this.syncWithBackend();
+      return true;
+      
+    } catch (error: unknown) {
+      clientLogger.error(`Errore durante restore: ${String(error)}`, 'SESSION');
+      throw error;
+    }
+  }
+
+  // Setup activity tracking con protezione anti-loop
+  setupActivityTracking(): void {
+    // Evita setup multipli
+    if ((window as unknown as Record<string, unknown>).__sessionTrackingSetup) {
+      clientLogger.debug('🔄 Session tracking già configurato, skip');
+      return;
+    }
+    
+    clientLogger.debug('🔄 Configurazione session tracking...');
+    
+    // Track user activity con debouncing
+    const events = ['mousedown', 'keypress', 'scroll', 'touchstart', 'click'];
+    let activityTimeout: NodeJS.Timeout | null = null;
+    
+    const updateActivity = () => {
+      // Debounce per evitare spam di aggiornamenti
+      if (activityTimeout) {
+        clearTimeout(activityTimeout);
+      }
+      
+      activityTimeout = setTimeout(() => {
+        this.updateLastActivity();
+      }, 2000); // Aggiorna massimo ogni 2 secondi
+    };
+
+    const listeners: Array<() => void> = [];
+    
+    events.forEach(event => {
+      const listener = () => updateActivity();
+      document.addEventListener(event, listener, { passive: true });
+      listeners.push(() => document.removeEventListener(event, listener));
+    });
+
+    // Periodic sync con protezione
+    let syncInProgress = false;
+    const syncInterval = setInterval(async () => {
+      if (syncInProgress) {
+        clientLogger.debug('🔄 Sync già in corso, skip');
+        return;
+      }
+      
+      try {
+        syncInProgress = true;
+        const session = this.loadSession();
+        if (session) {
+          await this.syncWithBackend();
+        }
+      } catch (error: unknown) {
+        clientLogger.error(`Errore sync session: ${String(error)}`, 'SESSION');
+      } finally {
+        syncInProgress = false;
+      }
+    }, 120000); // Sync ogni 2 minuti invece di 1
+
+    // Cleanup function globale
+    (window as unknown as Record<string, unknown>).__sessionTrackingCleanup = () => {
+      clientLogger.debug('🧹 Cleanup session tracking...');
+      if (activityTimeout) clearTimeout(activityTimeout);
+      clearInterval(syncInterval);
+      listeners.forEach(cleanup => cleanup());
+      delete (window as unknown as Record<string, unknown>).__sessionTrackingSetup;
+      delete (window as unknown as Record<string, unknown>).__sessionTrackingCleanup;
+    };
+    
+    // Marca come configurato
+    (window as unknown as Record<string, unknown>).__sessionTrackingSetup = true;
+    clientLogger.debug('✅ Session tracking configurato');
+  }
+
+  // Clean up expired sessions
+  cleanup(): void {
+    const session = this.loadSession();
+    if (session && Date.now() > session.expiresAt) {
+      this.clearSession();
+    }
+  }
+
+  // Ripristina le connessioni store dal backend Rust nel localStorage
+  // Chiamata al boot dell'app per garantire che le credenziali persistano tra i riavvii
+  async restoreStoreConnections(): Promise<void> {
+    // Evita esecuzioni multiple
+    if ((globalThis as unknown as Record<string, unknown>).__storeConnectionsRestored) return;
+    (globalThis as unknown as Record<string, unknown>).__storeConnectionsRestored = true;
+
+    try {
+      const ACCOUNTS_KEY = 'gameStringer_connectedAccounts';
+      const existing: Array<Record<string, unknown>> = JSON.parse(localStorage.getItem(ACCOUNTS_KEY) || '[]');
+      let changed = false;
+      const has = (p: string) => existing.some((a) => a.provider === p);
+
+      // Steam
+      if (!has('steam-credentials')) {
+        try {
+          const creds = await invoke<Record<string, string>>('load_steam_credentials');
+          if (creds?.steam_id && creds.steam_id.length > 0) {
+            existing.push({ provider: 'steam-credentials', userId: creds.steam_id, steamId: creds.steam_id });
+            changed = true;
+            clientLogger.debug('[BOOT] Steam credentials restored');
+          }
+        } catch { /* nessuna credenziale */ }
+      }
+
+      // Epic
+      if (!has('epicgames')) {
+        try {
+          const creds = await invoke<Record<string, string>>('load_epic_credentials');
+          if (creds?.username_encrypted) {
+            existing.push({ provider: 'epicgames', userId: 'epic-user' });
+            changed = true;
+            clientLogger.debug('[BOOT] Epic credentials restored');
+          }
+        } catch { /* nessuna credenziale */ }
+      }
+
+      // GOG
+      if (!has('gog-credentials')) {
+        try {
+          const creds = await invoke<Record<string, string>>('load_gog_credentials');
+          if (creds?.email || creds?.username) {
+            existing.push({ provider: 'gog-credentials', userId: creds.username || 'gog-user' });
+            changed = true;
+            clientLogger.debug('[BOOT] GOG credentials restored');
+          }
+        } catch { /* nessuna credenziale */ }
+      }
+
+      // Ubisoft
+      if (!has('ubisoft-credentials')) {
+        try {
+          const creds = await invoke<Record<string, string>>('load_ubisoft_credentials');
+          if (creds?.email) {
+            existing.push({ provider: 'ubisoft-credentials', userId: creds.email });
+            changed = true;
+            clientLogger.debug('[BOOT] Ubisoft credentials restored');
+          }
+        } catch { /* nessuna credenziale */ }
+      }
+
+      if (changed) {
+        localStorage.setItem(ACCOUNTS_KEY, JSON.stringify(existing));
+        clientLogger.debug(`[BOOT] Store connections restored: ${existing.length} providers`);
+      }
+    } catch (error: unknown) {
+      clientLogger.warn(`[BOOT] Errore ripristino store connections: ${String(error)}`, 'SESSION');
+    }
+  }
+}
+
+export const sessionPersistence = SessionPersistence.getInstance();

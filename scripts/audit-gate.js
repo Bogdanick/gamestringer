@@ -1,0 +1,253 @@
+#!/usr/bin/env node
+/**
+ * Gate `npm audit` con allowlist motivata (task ROADMAP `sec-deps`).
+ *
+ * `npm audit` non ha un equivalente di `cargo audit --ignore`: o passa tutto
+ * o fallisce. Questo script fa da gate al posto suo, con le stesse regole che
+ * usiamo su cargo:
+ *
+ *   - bloccano solo le vulnerabilità high/critical (low/moderate = rumore);
+ *   - le eccezioni sono ECCEZIONI MOTIVATE, non silenziamenti: ognuna ha una
+ *     motivazione scritta e una data di scadenza. Passata quella data il gate
+ *     torna rosso e l'eccezione va rivista o rimossa;
+ *   - se una vulnerabilità in allowlist sparisce (dipendenza aggiornata) lo
+ *     script lo segnala, così l'eccezione viene cancellata alla prima occasione.
+ *
+ * Se `npm audit` stesso fallisce (registry irraggiungibile, JSON malformato)
+ * il gate fallisce: mai fail-open su un audit rotto.
+ *
+ * Uso:  node scripts/audit-gate.js [--level=high]
+ */
+
+const { spawnSync } = require('child_process');
+const path = require('path');
+
+const ROOT = path.resolve(__dirname, '..');
+
+/**
+ * Eccezioni attive. Ogni voce va giustificata: perché il codice vulnerabile
+ * non è raggiungibile da input di terzi, e cosa sblocca la rimozione.
+ */
+const ALLOWLIST = [
+  {
+    id: 'GHSA-vfj7-8cjw-p6xm',
+    package: 'braces',
+    until: '2026-11-20',
+    reason: [
+      'braces <=3.0.3 va in stack exhaustion espandendo pattern di parentesi',
+      'graffe annidati in profondità. Impatto solo Availability (crash).',
+      '',
+      'Perché non si aggiorna e basta: il range vulnerabile è <=3.0.3 e la',
+      '3.0.3 è l\'ULTIMA versione pubblicata (settembre 2024, verificato sul',
+      'registry il 20/10/2026). Non esiste un fix, né backport né major:',
+      'nessun `npm audit fix` e nessun override possibile. Il «fix» che npm',
+      'propone è tailwindcss 4, una migrazione dell\'intero CSS, non un bump.',
+      '',
+      'Perché non è raggiungibile da input di terzi:',
+      '  - braces arriva solo da micromatch / fast-glob / chokidar 3, tirati',
+      '    da tailwindcss 3.3.3 e da eslint-config-next: tutti',
+      '    devDependencies, il gate lo marca «solo dev». Niente finisce nel',
+      '    bundle Tauri spedito (il chokidar di dependencies è il 5, che non',
+      '    usa braces).',
+      '  - i pattern che espande sono i glob scritti da noi nel `content` di',
+      '    tailwind.config e nella config ESLint: input LOCALE dello',
+      '    sviluppatore, mai dati da rete o da un gioco tradotto.',
+      '  - nessun sorgente dell\'app importa braces, micromatch o fast-glob',
+      '    (grep su app/ components/ lib/ hooks/ scripts/ il 20/10/2026).',
+      '',
+      'Cosa sblocca la rimozione: una braces >3.0.3 col fix (allora basta',
+      '`npm update braces`), oppure la migrazione a tailwindcss 4 insieme a',
+      'un eslint-config-next che non tiri più fast-glob 3.',
+    ].join('\n'),
+  },
+  // GHSA-ggr8-5vv4-36mx (deepmerge-ts, CVE-2026-40345) — pensionata il
+  // 20/10/2026, in anticipo sulla scadenza del 02/11. @prisma/config 6.x pinna
+  // ancora deepmerge-ts 7.1.5, ma l'unico uso è `deepmerge()` semplice come
+  // `merger` di c12 per fondere prisma.config: nessuna delle rotture della 8.x
+  // lo tocca (riguardano deepmergeInto, nomi di tipi e merge delle Map), e
+  // @prisma/config 7.10.1 è già passato da solo a deepmerge-ts 8.0.2. Quindi
+  // override in package.json invece di eccezione; verificato con
+  // `prisma validate` e `prisma generate`.
+  //
+  // Vuota dal 04/08/2026 al 17/08/2026 — e che torni vuota il prima possibile.
+  //
+  // Storia della prima eccezione avuta (GHSA-mh99-v99m-4gvg, brace-expansion,
+  // datata 30/09): al 27/07 il fix esisteva solo in 5.x, senza backport, e
+  // l'override era impossibile (il build CJS di 5.x esporta un oggetto e
+  // rompe minimatch 3.x a runtime). Il 04/08 i backport sono ARRIVATI
+  // (1.1.18 / 2.1.4, insieme al successore GHSA-rgw5-rvv9-x895) e un
+  // semplice `npm audit fix` ha chiuso tutto: eccezione pensionata IN
+  // ANTICIPO sulla scadenza. Morale: le eccezioni datate vanno riverificate
+  // a ogni giro — i backport che oggi non esistono domani possono esserci.
+];
+
+const LEVELS = { info: 0, low: 1, moderate: 2, high: 3, critical: 4 };
+
+function runAudit(omitDev) {
+  const args = ['audit', '--json'];
+  if (omitDev) args.push('--omit=dev');
+  // NON TOGLIERE shell:true su Windows, e non provare a sostituirlo nominando
+  // 'npm.cmd': dà spawnSync EINVAL. Provato il 27/07/2026.
+  //
+  // Le due patch di Node si contraddicono. Da 18.20.2/20.12.2 (mitigazione
+  // CVE-2024-27980) spawnare un .cmd/.bat SENZA shell è vietato e fallisce con
+  // EINVAL; ma spawnarlo CON shell stampa DEP0190, perché con la shell di mezzo
+  // gli argomenti vengono concatenati e non escapati. Su Windows `npm` È npm.cmd,
+  // quindi le uniche uscite sono shell:true col warning, oppure invocare
+  // node su npm-cli.js — che però va localizzato a mano e si rompe con nvm/volta.
+  //
+  // Qui gli argomenti sono costanti scritte dieci righe più sopra: nessun input
+  // di terzi li tocca, quindi il rischio che DEP0190 descrive non esiste. Il
+  // warning è rumore nei log, non un difetto: si tiene.
+  const res = spawnSync('npm', args, {
+    cwd: ROOT,
+    encoding: 'utf8',
+    maxBuffer: 64 * 1024 * 1024,
+    shell: process.platform === 'win32',
+  });
+
+  if (res.error) {
+    throw new Error(`impossibile eseguire npm audit: ${res.error.message}`);
+  }
+  // npm audit esce !=0 quando trova vulnerabilità: è normale, il verdetto lo
+  // diamo noi. Quello che NON è normale è uno stdout che non è JSON.
+  let parsed;
+  try {
+    parsed = JSON.parse(res.stdout);
+  } catch {
+    throw new Error(
+      `npm audit non ha prodotto JSON valido (exit ${res.status}).\n` +
+        `stdout: ${(res.stdout || '').slice(0, 500)}\n` +
+        `stderr: ${(res.stderr || '').slice(0, 500)}`
+    );
+  }
+  if (parsed.error) {
+    throw new Error(`npm audit ha restituito un errore: ${JSON.stringify(parsed.error)}`);
+  }
+  return parsed;
+}
+
+/** Estrae gli advisory (GHSA) dal report, con i pacchetti impattati. */
+function collectAdvisories(report) {
+  const advisories = new Map();
+  for (const [pkgName, vuln] of Object.entries(report.vulnerabilities || {})) {
+    for (const via of vuln.via || []) {
+      if (typeof via !== 'object' || !via.url) continue;
+      const id = via.url.split('/').pop();
+      if (!advisories.has(id)) {
+        advisories.set(id, {
+          id,
+          url: via.url,
+          title: via.title,
+          severity: via.severity,
+          source: via.name,
+          packages: new Set(),
+        });
+      }
+      advisories.get(id).packages.add(pkgName);
+    }
+  }
+  return advisories;
+}
+
+function main() {
+  const levelArg = process.argv.find((a) => a.startsWith('--level='));
+  const minLevel = LEVELS[levelArg ? levelArg.split('=')[1] : 'high'];
+  if (minLevel === undefined) {
+    console.error(`Livello non valido: ${levelArg}`);
+    process.exit(2);
+  }
+
+  const full = runAudit(false);
+  const prodOnly = runAudit(true);
+  const advisories = collectAdvisories(full);
+  const prodAdvisories = collectAdvisories(prodOnly);
+
+  const allowById = new Map(ALLOWLIST.map((e) => [e.id, e]));
+  const today = new Date().toISOString().slice(0, 10);
+
+  const blocking = [];
+  const excused = [];
+  const belowLevel = [];
+
+  for (const adv of advisories.values()) {
+    if (LEVELS[adv.severity] < minLevel) {
+      belowLevel.push(adv);
+      continue;
+    }
+    const exception = allowById.get(adv.id);
+    if (!exception) {
+      blocking.push({ adv, why: 'nessuna eccezione' });
+    } else if (exception.until < today) {
+      blocking.push({ adv, why: `eccezione SCADUTA il ${exception.until}` });
+    } else {
+      excused.push({ adv, exception });
+    }
+  }
+
+  const stale = ALLOWLIST.filter((e) => !advisories.has(e.id));
+
+  // ---- report ----
+  const counts = full.metadata?.vulnerabilities || {};
+  console.log('=== Gate npm audit ===');
+  console.log(
+    `Totali: ${counts.critical || 0} critical, ${counts.high || 0} high, ` +
+      `${counts.moderate || 0} moderate, ${counts.low || 0} low ` +
+      `(soglia bloccante: ${levelArg ? levelArg.split('=')[1] : 'high'})`
+  );
+  if (belowLevel.length) {
+    console.log(`Sotto soglia, non bloccanti: ${belowLevel.length} advisory.`);
+  }
+
+  // Un advisory che compare anche con --omit=dev tocca il runtime spedito
+  // all'utente; gli altri restano confinati agli strumenti di sviluppo.
+  const scopeOf = (id) => (prodAdvisories.has(id) ? 'PROD' : 'solo dev');
+
+  for (const { adv, exception } of excused) {
+    const scope = scopeOf(adv.id);
+    console.log(`\n⚠️  TOLLERATA ${adv.id} [${adv.severity}, ${scope}] — scade ${exception.until}`);
+    console.log(`    ${adv.title}`);
+    console.log(`    pacchetti: ${[...adv.packages].sort().join(', ')}`);
+    console.log(
+      exception.reason
+        .split('\n')
+        .map((l) => `    | ${l}`)
+        .join('\n')
+    );
+  }
+
+  for (const e of stale) {
+    console.log(
+      `\n🧹 Eccezione non più necessaria: ${e.id} (${e.package}) non compare più ` +
+        `nell'audit. Rimuovila da scripts/audit-gate.js.`
+    );
+  }
+
+  for (const { adv, why } of blocking) {
+    const scope = scopeOf(adv.id);
+    console.log(`\n❌ BLOCCANTE ${adv.id} [${adv.severity}, ${scope}] — ${why}`);
+    console.log(`    ${adv.title}`);
+    console.log(`    pacchetti: ${[...adv.packages].sort().join(', ')}`);
+    console.log(`    ${adv.url}`);
+  }
+
+  if (blocking.length) {
+    console.log(
+      `\nGate FALLITO: ${blocking.length} advisory ≥ soglia senza eccezione valida.\n` +
+        `Aggiorna la dipendenza, oppure aggiungi un'eccezione MOTIVATA e datata in ` +
+        `scripts/audit-gate.js.`
+    );
+    process.exit(1);
+  }
+
+  console.log(
+    `\n✅ Gate superato${excused.length ? ` (${excused.length} eccezione/i attive)` : ''}.`
+  );
+}
+
+try {
+  main();
+} catch (err) {
+  console.error(`❌ Gate npm audit non eseguibile: ${err.message}`);
+  process.exit(2);
+}

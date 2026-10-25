@@ -1,0 +1,103 @@
+{
+  "productName": "GameStringer",
+  "version": "1.17.0",
+  "identifier": "com.gamestringer.app",
+  "build": {
+    "beforeDevCommand": "",
+    "beforeBuildCommand": "node scripts/build-tauri-cross.js",
+    "devUrl": "http://127.0.0.1:3293",
+    "frontendDist": "../out"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "GameStringer",
+        "width": 1280,
+        "height": 900,
+        "minWidth": 1024,
+        "minHeight": 768,
+        "resizable": true,
+        "fullscreen": false,
+        "maximized": true,
+        "center": true,
+        "visible": false,
+        "decorations": true,
+        "alwaysOnTop": false,
+        "skipTaskbar": false
+      },
+      {
+        "label": "ocr-overlay",
+        "title": "OCR Overlay",
+        "width": 800,
+        "height": 600,
+        "resizable": true,
+        "fullscreen": false,
+        "center": true,
+        "visible": false,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "transparent": true,
+        "url": "/ocr-overlay"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https: https://steamcdn-a.akamaihd.net https://cdn.akamai.steamstatic.com https://shared.akamai.steamstatic.com https://cdn.steamgriddb.com https://cdn2.steamgriddb.com https://media.steampowered.com https://cdn.cloudflare.steamstatic.com https://store.steampowered.com https://avatars.githubusercontent.com; connect-src 'self' https://gamestringer.ai https://api.openai.com https://api.anthropic.com https://generativelanguage.googleapis.com https://api.deepseek.com https://api.mistral.ai https://openrouter.ai https://api.deepl.com https://api-free.deepl.com https://api.groq.com https://api.cerebras.ai https://api.cohere.com https://api.together.xyz https://api.fireworks.ai https://api-inference.huggingface.co https://api.cognitive.microsofttranslator.com https://api.mymemory.translated.net https://dashscope.aliyuncs.com https://api.elevenlabs.io https://libretranslate.de https://lingva.ml https://api.github.com https://api.nexusmods.com https://api.steampowered.com https://api.rawg.io https://api.igdb.com https://howlongtobeat.com https://www.steamgriddb.com https://*.supabase.co wss://*.supabase.co http://127.0.0.1:* http://localhost:*; font-src 'self' data:; media-src 'self' blob:",
+      "capabilities": [
+        "default",
+        "app-events"
+      ]
+    },
+    "withGlobalTauri": true,
+    "macOSPrivateApi": true
+  },
+  "bundle": {
+    "active": true,
+    "createUpdaterArtifacts": "v1Compatible",
+    "targets": "all",
+    "resources": [
+      "resources/gs-hook/x64/*",
+      "resources/gs-hook/x86/*"
+    ],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico",
+      "icons/icon.icns"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "10.15",
+      "frameworks": [],
+      "signingIdentity": null
+    },
+    "linux": {
+      "deb": {
+        "depends": [
+          "libwebkit2gtk-4.1-0",
+          "libayatana-appindicator3-1"
+        ]
+      },
+      "appimage": {
+        "bundleMediaFramework": false
+      }
+    },
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper"
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDhDQjhERUYxRkI1REEyRDYKUldUV29sMzc4ZDY0akRpQm05c2M5RFFNSlRqWHA1bi9ZTnZKcjBST0pJZU5aZHVpM2xQOUFrRXIK",
+      "endpoints": [
+        "https://github.com/rouges78/GameStringer/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  }
+}

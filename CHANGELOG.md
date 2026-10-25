@@ -1,0 +1,825 @@
+# GameStringer Changelog
+
+## 🚀 v1.17.0 - 2026-08-17
+
+- ✨ gamemaker: Draw accented glyphs in the font region's free space - the accents are finally on screen, and the same patch damages R and ?
+- ✨ gamemaker: Generalize glyph-injection planning beyond kanji donors - pianifica() now takes a donor predicate and pianifica_da_lista() plans from an explicit codepoint list so Latin fonts can donate corpus-measured symbols; the historical kanji path is untouched and the plan stays deterministic. This file belonged with f08624bf, which does not compile without it
+- ✨ hendrix: Honor the user's LOCAL/ONLINE backend choice and mount the last two backend pickers; fix(dev): split tStatic and useProfileAuth out of component files - mixed exports disabled Fast Refresh, degrading every dev navigation to a full reload
+- ✨ godot: Read the .pck - the extractor existed in Rust but no page called it, so commercial Godot games reported zero files with a green check
+- ✨ rpgmaker: Honor the user's LOCAL/ONLINE backend choice - the cloud branch existed for every other engine but this one
+- ✨ ollama: Log the resolved endpoint with every translation, and move the address field into the Ollama card where users actually look
+- ✨ notifications: Wire the event subsystem, and fix the three silent drops it was hiding
+- ✨ game page: Say whether the user's language is missing, instead of leaving it to be guessed from flags
+- ✨ support: Ask for a contribution after a proven success, not a simulated one
+- ✨ tools: Translation cost estimator and orphan-deps gate with documented implicit uses
+- ✨ translation: Visionaire and Tyrano now ask instead of guessing the backend, with a one-time migration of the old auto-detect
+- ✨ settings: Global Local/Online translation choice, with per-game overrides shown and clearable
+- ✨ danganronpa: Inject Italian accented glyphs into the DR1 font, verified before writing
+- ✨ danganronpa: Read-only probes decode the DR1 font format (SpFt table + 8-bit indexed atlas)
+- ✨ danganronpa: DR1 translated end-to-end from String it!
+- ✨ danganronpa: String it! now runs the full DR1 cycle in-app
+- ✨ danganronpa: In-app WAD rebuild - the repack finally lives in Rust
+- ✨ hub: Cover backdrop and real flag icons on pack and project cards
+- ✨ projects: Direct link to the published pack on the project card
+- ✨ hub: Wire packs tab and navigation to translation_packs
+- ✨ renpy: Stop survives page navigation - stable-key stop requests on the global progress widget
+- ✨ hub: Publish reads the same content source as export; the DB decides pack status
+- ✨ renpy: Pipeline-generated language activator, block-level anti-echo, Stop button, Opus 5 as premium model
+- ✨ renpy: Test batch - see the game speak Italian before paying for the whole script
+- ✨ renpy: Give the cloud backend a button, and the batch loop a brake
+- ✨ projects: Disk is the source of truth for the project registry too
+- ✨ renpy: Read the scripts commercial games hide inside .rpa - Scarlet Hollow, 83,489 strings
+- 🐛 gm-font: Clean accents on latin fonts via anti-bleeding margin and RangeEnd widening
+- 🐛 gamemaker: Mask control codes before the model instead of repairing after - the fast path sent raw strings and the model translated the codes as words, breaking 891 strings and soft-locking Deltarune at 'DO YOU ACCEPT IT?'; the TS guard could not have helped, it does not even recognise & ^6 or a trailing %
+- 🐛 tests: Point the useProfileAuth mock at the module the hook actually lives in - it moved in 9ee126d5 and the mock kept targeting the old path, so vi.mock built a phantom module, silently stopped mocking, and left 35 tests red on main
+- 🐛 pricing: DeepSeek V4 Flash peak rate before the 16:00 UTC hike - the bundled price was exactly the pre-hike one and would have understated every estimate by 3x; align the model catalog to the defaults the code actually uses; remove the Sonnet 5 deadline that was cancelled on Aug 10
+- 🐛 godot: Tell the truth about RSRC files - binary .translation files were silently dropped and their newlines counted as strings, so games with localization showed zero files and a green check; count each unreadable file once, not twice
+- 🐛 godot: Tell the truth about RSRC files - binary .translation files were silently dropped and their newlines counted as strings, so games with localization showed zero files and a green check
+- 🐛 gamemaker: String it! finishes the job - remove the silent 500-string cap, report the game total instead of the batch, and tell the user the translation lives in the Japanese slot
+- 🐛 telemetry: Report the strings actually written into the game - the workflow calculated them and threw them away, so the database certified 12 successes out of 12 with zero evidence
+- 🐛 scan: Never offer GameStringer's own work files for translation - the auto-translator ate its own checkpoint and destroyed 200 paid translations; fix(security): redact API keys in logs; fix(providers): network errors are not fatal
+- 🐛 security: Redact API keys from log messages at the sink; fix(providers): network failures get a short cooldown with the real cause, never a permanent block
+- 🐛 site: Compat page copy now matches the proven-only view, in all 12 languages, and unproven runs get their own awaiting-confirmation chip
+- 🐛 compat: Stop counting unproven successes in the public view; add fetch timeout so the error state is reachable
+- 🐛 nav: The Visual Novel patcher had no way in
+- 🐛 ollama: The last two hardcoded addresses, and a gate so they cannot come back
+- 🐛 danganronpa: Extract from the right bytes — three parsers, three conventions for the same field
+- 🐛 ollama: Resolve the endpoint in the prediction workflow too — nine hardcoded URLs left
+- 🐛 engine: Find Unreal when the game sits in a platform subfolder, as UE5 packages it
+- 🐛 ollama: Let the user's endpoint reach the translator, not just the status light
+- 🐛 security: Drop the abandoned sevenz-rust for sevenz-rust2, which validates entry paths
+- 🐛 ci: Shelve translation-recommendation in the dead-modules baseline — the CI has been red since it was unwired
+- 🐛 engine: Tell Mono from IL2CPP on the game page, and stop caching 'Unknown' as if it were a verdict
+- 🐛 danganronpa: Patch the font in the .gsbackup too — a rebuild would have silently restored the accent-less font
+- 🐛 danganronpa: Write the codepoint->index map — the game looks up glyphs there, not in the record; accents now render in-game
+- 🐛 dialog: Confirm() was async in Tauri and never awaited; quiet the dead notifications subsystem
+- 🐛 tauri: Add dialog:allow-confirm capability - every confirm() dialog was silently broken
+- 🐛 hub: Atomic publish with rollback, double-click guard, completion clamp
+- 🐛 gspack: A failed export no longer vanishes silently
+- 🐛 renpy: Screen blocks survive blank lines - every Ren'Py menu we ever shipped was untranslated
+- 🐛 renpy: Honest counters, a visible test batch, and two red errors that were not errors
+- ♻️ game page: Remove the info box that repeated five fields already in the hero
+- ♻️ game page: Drop the second translation pipeline and unreachable code — one honest button instead of two, one of which faked success
+- • changelog: Translate the v1.16.0 changelog into de, pt, zh via local Ollama
+- • Docs+fix: v1.16.0 shipped - roadmap tells the ten-defect story; changelog in es/fr/it/ko via local Ollama; drop dead Buy Me a Coffee button (page is 404), Ko-fi promoted to primary
+
+## 🚀 v1.16.0 - 2026-08-06
+
+- ✨ feedback: Surface feedback beyond Settings - sidebar entry, /feedback page, one-time post-translation invite via feedback bus
+- ✨ unity: Register runtime-XUnity games on the Projects page (Uncanny Tales case)
+- ✨ sci: --apply now leaves the standard Projects trace (translation_session.json)
+- ✨ unreal: American Arcadia in ITALIAN on screen — EncodedPakEntries decoded, Oodle unlocked without the DLL, phase 1 mounted
+- ✨ sci: Full Sierra SCI0 toolkit — LZW+Huffman decoder from scratch, patch channel and accents proven in-game on Larry 3
+- ✨ unreal: Pak index probe - American Arcadia was never untranslatable; reading a 12GB pak's footer and full directory index takes 2ms with seeks, while extract_unreal_localization loads the whole file into RAM and dies into a log::warn; from v10 the primary index holds path hashes, names live in the full directory index; found the game's text: StringTables per level under Logic/Data/Subtitles
+- ✨ guard: Real line breaks are protected tokens - Greed notes flattened 169 newlines to 45 and text ran off screen; autoFixLineBreaks re-splits proportionally to source lines, preferring sentence-ending punctuation near the ideal cut, CRLF style inherited, deterministic and idempotent, composed into autoFixPlaceholders so every flow benefits; 8 tests
+- ✨ projects: Resume and export from the project card - Apri builds the full auto-translate URL from files[0].path (Visionaire stays on library), Download exports a .gspack from disk strings (first caller of load_translation_strings); backfill projects from translation_session.json files in game folders
+- ✨ projects: One game, one card - path-based identity dedupes projects, merge takes max not sum; UE apply registers the project and persists strings via save_translation_strings; fix(theme): derive ThemeProviderProps via ComponentProps - next-themes 0.4 dropped dist/types (CI #536), 0.3 does not re-export the type
+- ✨ progress: A real Stop button for the Visionaire job - cancel flag checked between chunks, checkpoint and partial patch flushed on stop, onCancel actually carried onto the operation (before, Cancel only repainted the UI while the job kept running); i18n keys in 12 locales
+- ✨ legal: Ship the terms with the patch - README next to the pak, disclaimer inside the gspack, and Add Game where users actually look for it
+- ✨ unreal: Generate the utoc/ucas pair automatically - the IoStore triple is now one button
+- ✨ log: Install a logger - the log crate had none, every message was silently dropped
+- ✨ unreal: Write .locmeta to register the target culture
+- ✨ unreal: Pak reader nativo v11 + Oodle — estrae i .locres dal .pak (Below: Game.locres 811 stringhe); estrazione IoStore→pak, DLL oo2core UE5.8
+- ✨ engines: Estrazione nativa Godot PCK e Ren'Py RPA — 3 comandi fantasma chiusi, restano 5 (tutti in moduli morti)
+- ✨ unreal: Caccia alle copie dell'array stringhe nel dump (--cerca-array, --copie)
+- ✨ a11y: Fourth ratchet — the 78 keyboard traps nobody was counting
+- ✨ unreal: The first .locres we didn't write ourselves
+- ✨ release: Announce on Discord without ever failing the release
+- ✨ translation: Opt-in fidelity block for mature content already in the source
+- ✨ unreal: Honest Oodle diagnosis, real-game corpus tests, format scanner
+- ✨ gamemaker: Deltarune speaks Russian — glyph UI, sorted glyph table, honest success messages
+- ✨ gamemaker: Apply-to-a-copy and patched-atlas export, plus idempotency
+- ✨ gamemaker: Gm_inject_glyphs command, ADR-005 end to end
+- ✨ gamemaker: TTF glyph rasteriser for ADR-005
+- ✨ gamemaker: Glyph injection planner and blitter
+- ✨ gamemaker: FONT glyph table + TPAG region reader
+- ✨ gamemaker: FONT chunk glyph table reader
+- ✨ gamemaker: 2zoq texture container, QOI over BZip2, checked against the real file
+- ✨ gamemaker: 2zoq texture container, QOI over BZip2
+- ✨ gamemaker: Codec QOI variante GameMaker, con round-trip verificato
+- ✨ gamemaker: Codec QOI variante GameMaker, con round-trip verificato
+- ✨ gamemaker: Read Deltarune-style lang/*.json before touching data.win
+- ✨ providers: The API address was never configurable, only the key
+- ✨ il2cpp: Read-only string literal extraction from global-metadata.dat
+- ✨ projects: Import button also accepts .gspack
+- 🐛 gamemaker: Stop translating single-word STRG literals - they are GML keys compared with == and killed the boot (telemetry pattern on 1.14/1.15); measured on real Deltarune demo data.win with new read-only probe scripts/gm-strg-probe.js: 6,087 lowercase literals passed the old filter, no lexical rule separates Cancel from active
+- 🐛 gspack: Export dialog looked up the wrong gameId — refused exports on translated games
+- 🐛 ui: Close two game-page lies + ONE-BUTTON completion dialog redesign
+- 🐛 unreal: Two silent failures found by the in-game proof on Greed Stays Home - find_project_name picked Engine/ (alphabetical order) so the pak mounted where the engine never looks, now skips Engine and prefers Content/Paks with 3 new tests; session re-apply hardcoded source_hash 0 so UE silently rejected every entry, session now persists real hashes; relax session backfill guard to time-based; ROADMAP: first commercial UE game translated end-to-end
+- 🐛 deps: Drop to-ico - the 1.0.1->1.1.5 bump dragged in the 2016 jimp chain (12 advisories, 5 critical); generate-icons.js uses png-to-ico via .default (transpiled ESM); regenerate icons as effect proof
+- 🐛 settings: The Reset button was a lie, and a boot race could wipe settings.json; feat(dev): port-manager evicts the zombie instead of moving house; chore(security): empty the audit allowlist - brace-expansion backports landed
+- 🐛 settings: The Reset button was a lie, and a boot race could wipe settings.json; feat(dev): port-manager evicts the zombie instead of moving house; chore(security): empty the audit allowlist - brace-expansion backports landed
+- 🐛 settings: Floating unsaved-changes bar - the only Save button lived top-right and scrolled away exactly when you were typing API keys at the bottom; fix(progress): narrow installPath in onCancel closure; docs(roadmap): per-origin storage findings
+- 🐛 progress: Narrow installPath inside the onCancel closure; docs(roadmap): per-origin storage kills settings/checkpoints/projects on every dev port change
+- 🐛 progress: Narrow installPath inside the onCancel closure - typecheck was red in bc34751f
+- 🐛 visionaire: Offset-preserving patch and durable checkpoint - in-game experiment proved the runtime addresses strings by offset (rebuilt table showed wrong lines vs voice), so translations now fit the original byte region or stay English, honestly counted; checkpoint also saved to disk via Rust because IndexedDB dies with every dev port change; model picker updated for translation specialists; fix 6200 percent and seconds-labeled-minutes in completion banner
+- 🐛 progress: Restored 'running' operations are ghosts - a JS job cannot survive an app restart, so mark them interrupted with resume instructions instead of replaying them alive with a fake ETA
+- 🐛 offline: Phantom model and lying counter - validate requested model against installed list with auto-fallback, translate 40 strings per Ollama call instead of one, count failures as failures; speed up Visionaire fast path (batch 40, parallel Google fallback, declared 500 cap)
+- 🐛 build: AlternativeMethod, not String, in the Unreal recommendation branch
+- 🐛 ui-truth: Remove invented percentages; three lies fixed on the game page
+- 🐛 unreal: Correct .locmeta magic against an authentic file
+- 🐛 steam: Find game folder when caller passes display name
+- 🐛 unreal: Stop silent v8 fallback when the game needs a newer pak
+- 🐛 unreal: Below runs in Italian - first UE5 game translated end-to-end. Fix silent repak 404 (asset is repak_cli-*, so the v8 custom writer always ran), add masquerade/inspection/verdict tests; UE5.6+ ignores orphan _P.pak without utoc/ucas pair, unregistered cultures masked as existing ones
+- 🐛 translation: Stop declaring success when nothing was translated - explicit Err instead of echoing the source, 414 batch split, honest per-session counters
+- 🐛 i18n: Second cleanup batch — 19 files, 289 keys x 12 locales, hardcoded 1037 to 823 (Italian 191 to 102); fix corrupted loading label and hardcoded it-IT date
+- 🐛 i18n: Stop counting logger calls as UI text (179 false positives), clean 141 hardcoded strings across 10 files, add 174 keys x 12 locales, fix 6 keys that rendered raw on screen
+- 🐛 i18n: Stop counting logger calls as UI text (179 false positives), clean up 141 hardcoded strings across 10 files, add 174 keys x 12 locales, and fix 6 keys that rendered raw on screen
+- 🐛 unreal: Il rumore binario che reggeva il parse — leggibilità del testo come verdetto
+- 🐛 batch: I file 'tradotti' che erano copie dell'originale, e il toast verde su zero successi
+- 🐛 overlay: La sidebar dell'app disegnata sopra il gioco, e l'elenco scritto a mano che l'ha causata
+- 🐛 auth: 85 rotte su 90 senza gate profilo, e il default che le lasciava passare
+- 🐛 a11y: Five icon-only buttons that announced themselves as nothing
+- 🐛 gs-hook: The DLL no release ever shipped, and the pattern scan that hooked a random function
+- 🐛 unreal: The locres magic we invented, and the three format bugs hiding behind it
+- 🐛 unreal: The launcher that claimed to translate, and the anti-cheat gate that was never called
+- 🐛 workflow: The effect check that always passed
+- 🐛 gamemaker: The font reader must survive its own reordering
+- 🐛 forum: Optimistic like, and a localStorage mock that was lying to the whole suite
+- 🐛 build: Due gitlink registrati senza .gitmodules, su un clone pulito arrivavano vuoti
+- 🐛 providers: A custom endpoint would have been blocked by the CSP
+- 🐛 dead-check: Modules covered only by tests are not dead
+- 🐛 lip-sync: Compile the module at all, and stop asking Rhubarb for a recognizer it has never had
+- 🐛 supabase: Anon could never insert feedback or telemetry
+- 🐛 tauri: Seven more invokes into the void, and the dead module behind three of them
+- 🐛 games: Cmd_helper.exe slipped through the junk filter
+- 🐛 tauri: Six commands the UI invoked that do not exist
+- 🐛 games: Stop launching GameStringer instead of the game
+- 🐛 ollama: Make the endpoint configurable and stop hiding a working server
+- 🐛 i18n: Stop forcing Italian on everyone
+- 🐛 forum: Let authors edit and delete their own threads
+- 🐛 forum: Category names showed raw i18n keys
+- 🐛 projects: Cover for imported packs, working Open link, and deletable active projects
+- 🐛 projects: Imported packs now get a cover, and Open opens the game detail page
+- 🐛 site: Honest engine claims - GameMaker and Unreal marked partial, drop unsupported 800+ games claim
+- ♻️ ollama: Drop the advanced module that duplicated seven live features
+- ♻️ ollama: Drop the streaming module nobody could reach
+- ♻️ community: Drop all in-app chat, keep the forum
+
+## 🚀 v1.14.0 - 2026-07-13
+
+- ✨ compat: Compatibility badge on game cards + abuse-guard migration
+- ✨ packs: Verifiable pack integrity via aggregated SHA-256
+- ✨ crash: Opt-in crash reporting to Supabase
+- ✨ fonts: Missing-glyph detection + automatic Noto font install for file-based engines
+- ✨ compat: Opt-in compatibility telemetry - the ProtonDB of translations
+- ✨ library: Robust language scan + manual 'Detect languages' button
+- ✨ news-feed: Clean MediaWiki diff descriptions and hide deal posts
+- 🐛 release: Use readline for ship confirm (hung on Windows waiting for stdin EOF)
+- • Translate v1.13.0 changelog keys across all 12 locales
+
+## 🚀 v1.13.0 - 2026-07-11
+
+- ✨ ue-translator: Mark the real-time tool as experimental
+- ✨ site: V1.12.0 section with infographics + developer note (12 languages)
+- ✨ settings: Controls for new translation-quality features + broaden provider allowlist
+- ✨ ai: Self-correcting reflection pass + local semantic RAG retriever
+- ✨ live: Visual-context (VLM) translation with native screenshot downscaling
+- ✨ ue-translator: Verifica che il gioco sia avviato prima di partire
+- 🐛 i18n: Backfill aiQuality/semantic/lore keys in all locales (locale-integrity)
+- 🐛 ci: Build release from current branch, not the not-yet-created tag
+- 🐛 supabase: Recreate forum INSERT policies in RLS hardening + graceful bridge bailout
+- 🐛 supabase: Dedupe migration version 20260626 (rename reactions_like_fix to 20260627)
+- • Backfill v1.12.0 changelog and ueTranslator error keys across 10 locales
+- • Completa le traduzioni aiQuality/loreRetrieval/semanticIndex in 10 lingue
+- • Translate v1.12.0 aiQuality/semantic/lore keys in 10 languages
+- • ue-translator: Localizza in inglese gli errori del backend e aggiunge le chiavi errore
+
+## 🚀 v1.12.0 - 2026-07-10
+
+- 👁️ Visual-context translation (VLM): the AI sees the frame and translates with context, resolving OCR ambiguities (e.g. "Chest" = coffer vs. body). Modes: OCR+VLM and full-VLM. Providers: Ollama, OpenAI, Gemini
+- 🖼️ Native downscale_capture command (Rust image/base64): crop + resize + JPEG re-encode screenshots before the VLM call — no new dependencies
+- 🪞 Reflection translator: optional self-correcting pass (write → reflect → refine) reviewing risky strings against glossary, tone, consistency and placeholders; selective by default, cost-capped
+- 🧠 Semantic RAG retriever: Translation Memory + glossary matched by meaning via local Ollama embeddings; lazy indexing, IndexedDB vector cache, fail-open to keyword matching
+- 🧰 Settings: controls for reflection mode, semantic RAG and the visual-context options (quality vs. latency/cost)
+- 🔌 Providers: broadened the allowlist (DeepL, Groq, Cerebras, Cohere, Together, Fireworks, Hugging Face, Azure Translator, DashScope, LibreTranslate, Lingva, MyMemory)
+- ⚡ Smoother live-translation pipeline and native image handling
+
+## 🔧 v1.11.2 - 2026-07-04
+
+- ✨ community: Add Community Hub overview panel with recent activity
+- ✨ news: Add Italian fan-translation RSS feeds; skip Next proxy under Tauri
+- ✨ stores: Detect Humble/GameJolt/BigFish installs + PCGW & ITA-patch lookup
+- ✨ projects: Publish completed project to Patch Hub (reuses publishPack, 7 i18n keys x12 langs)
+- ✨ engines: Wire String it! routing for Unity/Unreal/Godot + TyranoScript cloud pipeline
+- ✨ unity: Local Ollama translation bridge for XUnity (CustomTranslate)
+- 🐛 stores: Gate Big Fish registry reads behind cfg(windows) to fix Linux build
+- 🐛 supabase: Make forum migration replay-safe on preview branches
+- 🐛 i18n: Correct hardcoded-strings baseline to actual count (1432)
+- 🐛 settings: Skip corrections without gameId in fine-tuning game selector (tsc)
+- 🐛 checkpoint: Normalize gamePath identity keys (separators, casing, trailing slash) with legacy key migration
+- 🐛 settings: Fine-tuning panel usable without gameId (game selector, generate feedback, defensive metrics, locale-aware dates)
+- 🐛 godot: V3 directory-at-end (dir_offset) — correctly reads real Godot 4.4+ pck (verified on Slay the Spire 2: 15658 files, JSON localization found)
+- 🐛 godot: Correct .pck parser — remove phantom dir_offset, fix inverted flag bits, support format v3 (Godot 4.4+), reject encrypted dir
+- 🐛 tyrano: Iscript-aware .ks parser — skip [iscript]/[html] blocks and inline JS/config lines
+- 🐛 editor,logger: Guard setState/log after unmount to stop 'window is not defined' test leaks
+- 🐛 editor: Mount-guard to prevent flaky 'window is not defined' during static-export prerender
+- 🐛 lint: Escape literal quotes in JSX to satisfy react/no-unescaped-entities
+- 🐛 Handle last unguarded /api calls in Tauri (stream translate, export patch)
+- 🐛 unity-ink: Guard tool in Tauri (backend not ported; no more 501s)
+- 🐛 editor: Load project translations from IndexedDB TM (last /api removed)
+- 🐛 editor: Migrate translations CRUD to IndexedDB (drop dead /api routes)
+- 🐛 editor: Load game list via get_games (Tauri) instead of /api/games
+- 🐛 Guard legacy /api calls in Tauri (injekt stats, voice transcribe)
+- 🐛 unity: Resolve BepInEx download assets from GitHub API (drop hardcoded URLs)
+- 🐛 unity: Resolve XUnity/TMP download assets from GitHub API (drop hardcoded URLs)
+- 🐛 unity: Resolve UABEA download asset from GitHub API (fix 404)
+- 🐛 Save API keys + cloud LLM/store calls via Rust (drop dead /api routes)
+- 🐛 projects: Register hero project eagerly (id fallback to path) so jobs always appear in Projects
+- 🐛 forum: Make likes work (reactions read/delete policies + like_count trigger)
+- ♻️ settings: Slim Ollama card to lifecycle only, link Model Manager for models (dedup)
+- • Fill EN-fallback strings + missing guidePage keys across 10 locales
+- • Add ollamaManagerComp + fineTuningManager keys (12 langs), drop orphan key
+- • De-hardcode visual-translation-editor (toolbar, overlays, properties, export dialog)
+- • De-hardcode fine-tuning-manager (dataset/model panels, add useTranslation)
+- • De-hardcode main-layout (command palette, language selector, skip link)
+- • De-hardcode game-detail-client MB unit (rest are dev logs/brands)
+- • De-hardcode community-chat (offline/login prompts, messages, room dialog)
+- • De-hardcode injekt-overlay-config (section headers, px/ms units, actions)
+- • De-hardcode guide page (P.T./Dry Run/ranking/String it cards, flow diagram)
+- • De-hardcode custom-prompt-settings (persona/tone/prompt config, voice, toasts)
+- • De-hardcode inline-translator (title, language selectors, cost, actions)
+- • De-hardcode lip-sync-panel (audio input, recognizer, stats, engine targets)
+- • De-hardcode smart-context-panel (stats units, tabs, character/term forms)
+- • De-hardcode retro-ocr-panel (preprocessing params, controls, tips)
+- • De-hardcode secrets-dashboard (toasts, status cards, validate/generate panels)
+- • De-hardcode ai-translation-assistant (toasts, language selectors, translate controls)
+- • De-hardcode ocr-translator page (capture, upload, provider options, VLM desc)
+- • De-hardcode dubbing page (labs warning, config panels, pipeline, segments)
+- • De-hardcode file-selector (wizard banner, search, upload, file lists)
+- • De-hardcode steam-family-sharing (toasts, detect/analyze panels, shared games list)
+- • De-hardcode prediction-tool ranking page (stats, table headers, empty state)
+- • De-hardcode auto-translate page (diff, hints, progress units, patch results)
+- • De-hardcode live-ocr-overlay (controls, capture modes, language selectors, stats)
+- • De-hardcode gamemaker-translator (tabs, stats, pagination, note)
+- • De-hardcode context-harvester page (input, stats, constraints, saved harvests)
+- • De-hardcode ocr-image-processor (settings panel, upload area, results)
+- • De-hardcode translator/mtpe page (workflow steps, language selectors, review stats)
+- • De-hardcode injekt-ui-enhanced (stats, tabs, process list, profile management)
+- • De-hardcode editor page (notifications, explorer, translation area, glossary)
+- • De-hardcode settings page (API key headers, input placeholders)
+- • De-hardcode translator/pro page (AI recommendation, language selectors, cost estimate, export)
+- • De-hardcode translation-bridge page (add/import/lookup panels, language pair selectors)
+- • De-hardcode voice-profile-manager (form fields, expanded profile view, placeholders)
+- • De-hardcode projects page (card, filters, stat labels, toasts)
+- • De-hardcode emulator-translator (capture/screenshot UI, advanced settings, footer stats)
+- • De-hardcode translation-profile-manager (stats, form, actions, dialogs)
+- • De-hardcode notification-center (sort/filter controls, bulk actions, a11y labels)
+- • De-hardcode unity-csv-translator (tables, diff banner, ink, checkpoint, inject stats)
+- • De-hardcode binary-patcher page (extract/translate/review flow, anti-cheat, labels)
+- • De-hardcode translation-recommendation (engine toasts, chain UI, validation)
+- • De-hardcode wad-extractor (stats, workflow steps, filters, labels)
+- • De-hardcode rom-patcher-ui (apply/create patch flows, format info, labels)
+- • De-hardcode community-translations (form, filters, reviews, language/category options)
+- • De-hardcode unity-ink-translator (steps, stats, preview, log labels)
+- • De-hardcode security-dialog (tabs, password/session/2FA labels and toasts)
+- • De-hardcode cover-picker component (sources, filters, API key panel)
+- • De-hardcode bethesda-patcher page (labels, filters, export options)
+- • De-hardcode unity-localization page (labels, filters, export options)
+- • De-hardcode cri-patcher page (labels, badges, export options)
+- • De-hardcode translation-wizard page labels and language autonyms
+
+## 🔧 v1.11.1 - 2026-06-26
+
+- ✨ site: Add engine-coverage, safety and product-facts infographics (11 languages)
+- ✨ onboarding: Add 'How to translate' step to first-run wizard (12 languages), bump onboarding version to 5
+- ✨ site: Recolor brand to violet palette, add Patch Hub flow + AI spectrum infographics
+- ✨ site: Add 'Under the hood' section (11 langs), fix language dropdown contrast, correct 'open source' to 'source-available'
+- ✨ site: Add 'Under the hood' technical section (11 languages) + fix language dropdown contrast
+- 🐛 supabase: Idempotent forum policies + allow community users to create threads/posts
+- 🐛 supabase: Make forum schema policies idempotent so Supabase Preview re-runs cleanly
+- 🐛 chat: Route community-chat translation via fetch_url_content to bypass Tauri CORS
+- 🐛 site: Show real logo in footer instead of empty placeholder
+- 🐛 supabase: Make forum schema policies idempotent (DROP POLICY IF EXISTS) so Supabase Preview re-runs cleanly
+- • site: Translate Patch Hub flow + AI spectrum to all 11 languages
+
+## 🚀 v1.11.0 - 2026-06-25
+
+- ✨ patch-hub: Download packs to local .gspack library
+- ✨ patch-hub: Wire pack publishing to Supabase backend
+- ✨ visionaire: Motore di traduzione Visionaire + hook in startAutoTranslate + hero job tracking
+- ✨ community: Patch Hub + resilienza chat/Lobby community (CORS/login fallback)
+- ✨ i18n: Greco target ovunque + centralizza lista lingue; bonifica hardcoded settings/auto-translate
+- ✨ labs: Espone Fandub AI come Labs (flag experimental + badge in Guida, avviso onesto timing/voci); fuori dal flusso hero, sidebar invariata
+- ✨ rpgmaker-mvmz: Pipeline hero file-based dedicata (orchestratore + branch stepper, glossario, backup+apply in place, resume); chore(qa): validate-rpgmaker + checklist
+- ✨ rpgmaker: RPG Maker classico -> messaggio onesto + scelta OCR esplicita (no dirottamento silenzioso); hero file-based limitato a MV/MZ
+- ✨ hero-ux: Stato/progress unificati su tutti i motori + Ren'Py nel pannello stepper + messaggio onesto motori non supportati; chore(qa): script validate-renpy-tl + checklist aggiornata
+- ✨ renpy: Inietta i Character Voice Profile (tono/personalita/pattern) nel prompt auto-translate oltre al nome parlante; auto-estrazione se assenti; docs(todo) esito verifica glossario/voci/multi-LLM
+- ✨ i18n: Completa traduzioni es/fr/de/pt/pl/ja/zh/ko (EN->lingua); aggiorna baseline locale-integrity
+- ✨ sito: Redesign con infografiche del motore + i18n 11 lingue; docs(README/GUIDA/ARCHITETTURA) aggiornati; pulizia varianti sito legacy
+- 🐛 i18n: Bonifica authoring EN, 161 stringhe semi-tradotte in en.json
+- 🐛 profiles: Aggiornamenti avatar-upload e profile-selector
+- 🐛 forum: Declassa a debug gli errori di backend irraggiungibile (522/timeout) - niente warn rumoroso quando il progetto community e' giu' (gestito con fallback vuoto)
+- 🐛 update-tracker: Patch_intact falso negativo per XUnity in sottocartella (BepInEx/plugins/XUnity.AutoTranslator/) - ricerca DLL ricorsiva; chore(log): riassunto compatto dei risultati Tauri (no dump oggetti enormi)
+- 🐛 news: RSS/og-image via fetch_url_content in Tauri + salta i proxy CORS pubblici nel webview (no errori allorigins); fix(ui): bottone 'Tutorial guidato' interamente cliccabile (TutorialMenu fullWidth)
+- 🐛 i18n-ru: Completa traduzione russa (481 stringhe EN→RU, copertura 97.5%, 0 residui IT) — issue #47
+- 🐛 i18n: Aggiunge changelog.v1_10_2 tradotto nei 10 locale non-IT (CI locale-integrity)
+- ⚡ prompt: Dedupe glossary hint and cluster per-string context hints
+- ♻️ api: Pilota migrazione fetch('/api')->invoke - cover-picker via fetch_url_content (fallback web); aggiunge docs/API_MIGRATION_MAP.md (mappa per-endpoint)
+- • Fix residual Italian/garbage strings in en.json authoring
+- • Translate last 4 Italian stragglers in en.json
+- • Clean up it.json long-tail namespaces (stage 8, 245 keys)
+- • Clean up it.json minor component namespaces (stage 7, 102 keys)
+- • Clean up it.json across profiles, logging, audio, and minor namespaces (stages 4-6)
+- • Clean up it.json profiles/security + logging/audio/info namespaces (stages 4-5, 172 keys)
+- • Bonifica it.json tappa 3 (overlay/injekt), 63 chiavi it/en
+- • Bonifica it.json tappa 2 (pagine visibili), 123 chiavi it/en
+- • Bonifica it.json tappa 1 (common), 172 chiavi it/en
+- • Fase A+B prediction-tool (namespace predictionToolPage, 73 chiavi 12 lingue); baseline 3104->3022; tetti es 36/pt 47
+- • en: Traduce 175 stringhe italiane rimaste in en.json + fix typo notifications; ripristina baseline fr 2
+- • Fase B bulk - traduzione completa 10 lingue (~9418 chiavi, copertura 90-97%); fix el changelog.v1_10_2 + ru Dry Run; baseline fr 2->3
+- • Bonifica hardcoded library/guide/projects/stores + onboarding + selettore greco UI; guard i18n-no-hardcoded in CI
+
+## 🚀 v1.10.0 - 2026-06-23
+
+- ✨ gs-hook: nuovo Universal Text Interception Framework — estrazione GDI/GetGlyphOutlineW, sostituzione glyph-by-glyph, hook Unreal FText, dual-arch x86/x64, gate anti-cheat e modalità passiva
+- ✨ Overlay in tempo reale: finestra live (Rust + frontend) con auto-apertura all'injection e traduzione del testo estratto tramite lo stack di traduzione dell'app
+- ✨ Universal injector completato: inject_translation_hook copre tutti i 12 engine (con fix RPG Maker), comandi registrati e supporto cross-platform
+- ✨ Nuovo motore Hendrix Localization per RPG Maker MV/MZ (via game_messages.csv)
+- ✨ Pipeline Ren'Py Hero end-to-end: traduzione offline in batch con contesto, glossario, voce e ripresa (resume)
+- ✨ Fallback OCR live per la copertura parziale di RPG Maker; Lingva instradato via Rust per superare i limiti CORS di Tauri
+- ✨ Ollama: nuova pagina funzioni avanzate (6 schede) con 8 funzionalità aggiuntive e relative traduzioni
+- ✨ AI: modelli Gemini/Claude selezionabili da variabili d'ambiente, con supporto provider premium
+- ✨ Aggiunta lingua dell'interfaccia Greco (el) e redesign del dialog del changelog
+- ✨ Traduzioni: XUnity aggiornato 5.5.0 -> 5.6.1 e 5 nuovi feed ITA; immagini sempre visibili nelle news con fallback a cascata
+- ✨ Sito: redesign sci-fi/cyberpunk, chatbot FAQ con knowledge base e versione aggiornata automaticamente dalle release GitHub
+- 🐛 Traduzione più affidabile: preservati i codici di controllo dei giochi nella traduzione offline e criterio di successo onesto per Unity
+- 🐛 Stabilità e qualità: fix community chat e auto-login, ripristino selettore profili, correzioni notifiche/profili (race e perdita dati), bonifica i18n in 9 lingue, ESLint 78->0, typecheck a 0 errori, suite Rust verde e CI allineata
+
+## 🔧 v1.10.1 - 2026-06-23
+
+- 🐛 Build macOS: abilitata la feature Tauri macos-private-api per la finestra overlay trasparente — la release multi-OS ora compila su Apple Silicon e Intel
+- 🐛 i18n: completate le chiavi storeGate in tutte le lingue (integrità dei locale, CI verde)
+
+## 🔧 v1.10.2 - 2026-06-23
+
+- ✨ impostazioni: Persistenza affidabile settings/API key + aggiunta manuale giochi da disco
+- 🐛 updater: Risolve blocco 'Preparazione' (update stantio passato a downloadAndInstall + reset updating in finally)
+
+## 🔧 v1.9.1 - 2026-04-29
+
+- Community Chat: fix avatars (gradient-IDs non generano più errori 404)
+- Community Chat: traduzione completa UI in 11 lingue
+- Icona di sistema: redesign neon GS logo e aggiunta icon.ico
+- Tauri: rimosso doppio start di Next.js per evitare conflitti sulla porta 3222
+- Splash Screen: aggiunto timeout di fallback (5s) per sblocco UI
+
+## 🔧 v1.9.0 - 2026-04-23
+
+- Community Hub UI: design sobrio e coerente — rimossi gradienti colorati, blob decorativi e ombre eccessive
+- Community Hub: KPI cards compatte, Category cards minimaliste, Trending cards uniformi
+- Friends Sidebar: larghezza ridotta (w-56), FriendCard compatte (avatar 7x7), sezioni Online/Offline più piccole
+- Scrollbar: ultra-sottili (4px), invisibili di default, appaiono solo al hover
+- Chat Persistente: bottone discreto, visibile su tutte le pagine, design elegante
+- Supabase Social Schema: schema compatibile con frontend (tools/supabase_social_compatible.sql)
+- Fix Chat Loop: aggiunto chatAttempted state per evitare chiamate ripetute a startDirectChat
+- Fix Mock Data: rimossi dati fittizi (user-123, etc.) da friends-sidebar che causavano errori UUID
+- Fix Ollama IPC: sostituiti tutti i check_ollama_status IPC con HTTP diretto a localhost:11434
+- Fix Stores: aggiunto link Stores nella sidebar sezione Risorse
+- Fix Epic Connect: Epic Games da OAuth rotto a modal credenziali
+- Fix Test Connessione: testConnection usa comandi Tauri reali invece di API simulata
+- Fix Disconnect: aggiunta cancellazione credenziali Epic/Steam nel backend Tauri
+- Fix Presence: aggiunto guard sessione in updatePresence per evitare 400 Bad Request
+
+## 🔧 v1.8.3 - 2026-04-18
+
+- Fix chat auto-connect coordination
+
+## 🔧 v1.8.1 - 2026-04-14
+
+- Fix CSP: aggiunto 'unsafe-eval' per compatibilità Next.js dev mode
+- Fix CSP: CSP permissiva in development, restrittiva in production
+- Fix CSP: aggiunto http://ipc.localhost per Tauri IPC
+- Fix i18n: corrette chiavi offlineTranslator.* nel widget Ollama dashboard
+- Fix Rust warnings: rimossi unused_mut e dead_code in 9 file backend
+- Middleware: CSP dinamica basata su NODE_ENV
+
+## 📝 v1.8.0 - 2026-04-09
+
+- Live Translation Overlay: traduzione in tempo reale via OCR overlay trasparente sopra qualsiasi gioco — cattura schermo → OCR multi-engine → traduzione AI (Groq/Cerebras) → overlay con animazioni gaming-style. Hotkey Ctrl+Alt+O
+- Hub Marketplace: marketplace per condividere translation pack della community — 1-click install, rating, recensioni, moderazione, profili utente con reputazione. Backend Supabase con 10 tabelle + RLS
+- Translation Memory Network: rete federata di memorie di traduzione — chi traduce contribuisce al pool globale (opt-in, privacy-first). Il prossimo utente trova stringhe gia tradotte. Integrazione automatica nel pipeline di traduzione
+- AI Dubbing Pipeline: pipeline 7-step per doppiaggio automatico — scan audio → Whisper STT → traduzione AI → sintesi vocale TTS con voice matching → duration matching → patch file audio → lip sync Rhubarb → generazione sottotitoli SRT/VTT/ASS
+- Plugin System: interfaccia PatcherPlugin per patcher community-created — detect/extract/patch/verify/restore lifecycle. Template generator per scaffold plugin. Nessuna ricompilazione Rust necessaria
+- Sicurezza: CSP rinforzata (rimosso unsafe-eval), XSS eliminato, storage API key crittografato AES-256-GCM, protezione CSRF, validazione Zod, rate limiting globale
+- Architettura: CI pipeline con tsc+eslint+vitest+npm audit, 71 nuovi test, 18 moduli estratti da file monolitici, 1197/1203 console.* migrati a logger strutturato, 893 catch tipizzati con :unknown
+- Refactoring: ai-translate-direct.ts (-429 righe, 5 moduli), game-detail-client.tsx (-636 righe, 8 componenti), translator/pro/page.tsx (-776 righe, 5 componenti)
+- Dipendenze: rimossi react-hot-toast e vdf duplicati, -42 pacchetti
+
+## 📝 v1.7.0 - 2026-04-08
+
+- Auto-Select Engine (🧠): nuovo preset 'Auto' che seleziona dinamicamente i migliori provider AI per lingua target e genere gioco — basato su benchmark reali (DeepL per europee, Claude per CJK, boost genere RPG/Adventure)
+- Quality History: tracking sessione qualità provider per lingua, riordino automatico chain in base a successi/fallimenti
+- Gridly CSV Export/Import: formato multi-lingua compatibile Gridly/Lokalise/Crowdin (ID | source | target per ogni lingua), auto-detect delimiter e colonne lingua
+- Duration Matching: sintesi vocale con adattamento automatico velocità per mantenere la durata dell'audio originale — two-pass TTS con Web Audio API measurement
+- Rhubarb Lip Sync: generazione dati lip-sync (visemi A-X) da audio con timeline visuale interattiva, export per Unity (blend shapes) e Unreal (FaceFX)
+- Video Extractor: link diretto dalla scheda gioco + game picker dalla libreria + auto-scan
+- Lip Sync Page: nuova pagina /lip-sync con pannello completo (recognizer, timeline, stats, export multi-engine)
+- Sidebar: aggiunta voce Lip Sync nella sezione Tools
+
+## 🔧 v1.6.1 - 2026-04-05
+
+- CI/CD: merge job per unificare latest.json da tutte le piattaforme (Windows/Linux/macOS)
+- CI/CD: guard step che fallisce la build se il signing non produce firme minisign valide
+- CI/CD: step 'Locate latest.json' per rilevare immediatamente se tauri-action non genera il manifest updater
+- Auto-update: rotata la chiave minisign di signing (pubkey B61C7704C9F3B554) — la vecchia non ha mai firmato nulla in CI
+- Docs: aggiunta RELEASE_PROCESS.md con procedura completa (signer, secrets, verifica, rollback)
+- Rimosso latest.json orfano dalla root del repo (placeholder con firme vuote)
+
+## 🚀 v1.6.0 - 2026-04-04
+
+- Bethesda Engine Patcher: Skyrim LE/SE/AE, Fallout 3/NV/4, Oblivion, Starfield con parser BSA v103-105 + BA2 GNRL/DX10 + ESP/ESM (FULL/DESC/NAM1)
+- CRI Middleware Patcher: parser CPK + CRILAYLA + MSG/BMD/FTD (Persona 5 Royal, Yakuza, Tales of, Dragon Ball) con rilevamento Shift-JIS/UTF-8/UTF-16
+- Unity Localization Package pipeline: StringTable, SharedTableData, Addressables catalog, Smart Strings tokenizer + validator
+- Universal PO export (gettext .po) per tutti i patcher con metadata project/language/source/engine
+- Wizard Stepper condiviso per flussi multi-step nei patcher
+- a11y: aria-label su icon button, CardTitle semantic headings, focus-visible su primitives, skip-to-content link, landmark main, sr-only italiano
+- a11y: prefers-reduced-motion e forced-colors (Windows High Contrast) rispettati
+- Design system: Card variants via cva (default/muted/highlight/success/error/warning), Button size xs + icon-sm
+- OCR Image Processor: wiring a backend Tauri Tesseract (sostituisce stub simulateOCR)
+- Text utilities: text-micro (9px) + text-2xs (10px) per eliminare classi Tailwind arbitrarie
+- Fix: prevent console flash loop su spawn processi Windows quando l'app è in tray (helper process_util::no_window_command)
+
+## 📝 v1.5.0 - 2026-03-24
+
+- Community Chat Realtime: chat in tempo reale integrata nel Community Hub con Supabase Realtime
+- 4 stanze predefinite: Generale, Traduzioni, Feedback & Bug, Annunci
+- Auto-bridge: login automatico Supabase tramite profilo GameStringer (nessun login aggiuntivo)
+- Presenza online: indicatore utenti connessi in tempo reale con Supabase Presence
+- Creazione stanze personalizzate per giochi o progetti specifici
+- Risposte, modifica ed eliminazione messaggi
+- Widget chat in basso a destra con drawer espandibile
+- Backend Supabase: PostgreSQL, RLS policies, trigger auto-profilo, RPC functions
+- i18n: traduzioni chat in tutte le 11 lingue supportate (IT, EN, ES, FR, DE, JA, ZH, KO, PT, RU, PL)
+- Tutorial interattivo Community Chat aggiunto
+- Guide utente aggiornate in 11 lingue con sezione Chat Community
+- Client Supabase unificato (eliminati Multiple GoTrueClient warnings)
+
+## 🔧 v1.4.2 - 2026-03-03
+
+- Vision LLM Translator: traduzione context-aware con screenshot del gioco (Ollama, Gemini, OpenAI)
+- Lore Assistant: chat RAG per lore e dialoghi del gioco
+- Auto-Hook Scanner: scansione memoria processo con WinAPI
+- System Monitor: monitoraggio VRAM/RAM in tempo reale (backend Rust)
+- Ollama Setup Wizard: installazione guidata AI locale step-by-step
+- Debug Console: console di debug con intercept console integrato
+- Plugin System: design doc PLUGIN_SYSTEM.md
+- GitHub Discussions: 12 discussioni create (Announcements, General, Ideas, Q&A, Show and tell, Polls)
+- Community Hub: fix fetch discussions con REST API pubblica (no token richiesto)
+- Sidebar: Vision LLM aggiunto, Workshop rinominato in Steam Workshop
+- Fix: Rendered more hooks — dynamic imports con ssr:false sulle nuove pagine
+- CI/CD: Tauri Signing Key per release firmate
+- Fix: Ollama provider cooldown invece di blocco permanente per errori di rete
+- Fix: Lingva 404 per testi lunghi (troncamento URL automatico)
+- Fix: Tutorial querySelector SyntaxError con selettori :contains()
+- Fix: Update Bell mostrava versione sbagliata (fallback hardcoded rimosso)
+- Auto-Translate Review: pulsante 'Traduci tutte le non tradotte' con progress bar
+
+## 📝 v1.4.1 - 2026-03-02
+
+- i18n: UI completa in 11 lingue (IT, EN, ES, FR, DE, JA, ZH, KO, PT, RU, PL)
+- Aggiunte traduzioni KO (coreano), PT (portoghese), RU (russo), PL (polacco) a translations.ts
+- Aggiornato Locale type e SUPPORTED_LOCALES con ru e pl
+- Creati locales/ru/common.json e locales/pl/common.json
+- Guide utente aggiornate in tutte le 11 lingue con sezioni v1.1-v1.4
+- Nuove guide utente: USER_GUIDE_KO.md, USER_GUIDE_PT.md, USER_GUIDE_RU.md, USER_GUIDE_PL.md
+- README.md e README_IT.md aggiornati con 11 lingue e nuove guide
+- CHANGELOG.md e main-layout changelog aggiornati
+- site-i18n.js aggiornato con ru e pl
+- CI: workflow Linux + Windows fixato e funzionante
+
+## 📝 v1.4.0 - 2026-02-13
+
+- Radix UI Unificato: migrati 37 file da @radix-ui/react-* a radix-ui, rimossi 27 pacchetti
+- Quality Badge nel Traduttore Pro: punteggio qualità per-riga con ContentTypeBadge e QualityScoreBadge
+- Live Quality Preview: anteprima qualità in tempo reale durante la traduzione batch
+- Dettaglio Traduzioni: tabella risultati con tipo contenuto (UI/Dialogo/Narrativa) e score 0-100
+- Supporto RTL: rilevamento automatico direzione testo e applicazione dir attribute
+- Ollama Generico: translateWithOllamaGeneric con PROVIDER_MAP e chain presets fallback
+- Ottimizzazione Bundle: optimizePackageImports aggiornato con radix-ui, framer-motion, recharts, cmdk
+- Pulizia TypeScript: 0 errori TS nei sorgenti, fix in 8 file (translation-quality, validator, notifications, tutorial)
+- Fix: regex match type casting in translation-quality.ts e translation-validator.ts
+- Fix: NotificationToastProps con props opzionali mancanti
+- Fix: TutorialProviderProps con userId opzionale
+- Fix: CreateNotificationRequest con profileId opzionale
+
+## 📝 v1.3.0 - 2026-02-09
+
+- Danganronpa WAD Patcher v15: All-Ice base + GameStringer override (35.865 stringhe)
+- WAD Text Extractor CLI: estrazione completa testi da WAD per traduzione
+- WAD Extractor UI: nuovo tab nel Danganronpa Patcher con editor e traduzione batch AI
+- Export Patch Distribuibile: crea .zip con WAD, install.bat, LEGGIMI.txt, translations.json
+- Export Patch UI: bottone export nel tab Applica Patch con dialog salvataggio nativo
+- Export Patch Backend Rust: comando export_danganronpa_patch con zip streaming
+- Dashboard Stats Reali: collegati a Translation Memory Rust e activity history
+- UI Danganronpa Patcher compattata: tutti i tab ottimizzati per densità informativa
+
+## 📝 v1.2.0 - 2026-02-06
+
+- Fallback Provider: traduzione automatica Gemini → DeepSeek → OpenAI in tutti i componenti
+- Audit /api/* completato: 0 fetch('/api/') attive, tutto compatibile Tauri
+- Danganronpa Filtro Smart: riduce 18K→3K stringhe con filtro locale + AI opzionale
+- Test E2E Playwright: 38 test reali (navigation, translation, danganronpa)
+- Fix: injection UI usa Tauri invoke invece di API routes
+- Fix: secrets dashboard, logging, import traduzioni ora locali
+- Fix: bug precedenza operatori in notification-indicator
+- Translation Memory e Offline Cache usano fallback provider
+
+## 📝 v1.1.0 - 2026-02-05
+
+- Website Multilingua: 9 lingue (EN, IT, ES, DE, FR, JA, ZH, KO, PT)
+- Selettore lingua nel nav con bandiere e auto-detect browser
+- Danganronpa Auto-Translator: traduzione automatica con estrazione PAK nativa
+- Test E2E con Playwright: 9 test per navigation, translation, danganronpa
+- Verifica API Key: controllo chiavi prima di iniziare traduzione
+- Stima Costo: calcolo automatico token e costo per provider
+- Rate Limit Handler: retry automatico con delay per quota API
+- Redirect automatico a Settings se API non configurata
+
+## 📝 v1.0.9 - 2026-01-31
+
+- UI Header Animati: Effetto 'respiro' con gradiente che si espande/contrae
+- Ombreggiature Header: shadow-xl con tinta blu per profondità
+- Menu Sidebar: Sub-item con hover verde scuro (emerald-600)
+- Gradiente uniforme: Sky → Blue → Cyan su tutti gli header Traduzione
+- 16 pagine aggiornate con nuovo stile header animato
+
+## 🔧 v1.0.8 - 2026-01-29
+
+- Fix: Pulsante 'Scarica' aggiornamento ora apre il browser correttamente
+- Fix: Usato Tauri shell API invece di window.open per link esterni
+- Aggiunto feedback toast per debug download
+
+## 📝 v1.0.7 - 2026-01-29
+
+- GitHub Discussions: Forum integrato nel Community Hub
+- Tab Discussions con grafica GameStringer personalizzata
+- Fetch automatico discussioni da GitHub con API route
+- Link esterni aperti con Tauri shell API
+- Community Hub: rimossi dati mock, ora solo dati reali
+- Rimosso modal warning 'In Sviluppo' dal Community Hub
+- Licenza aggiornata a v1.1 Source Available
+- Licenza: chiarito uso non-commercial (YouTuber/streamer OK)
+- Licenza: fork non-commerciali permessi esplicitamente
+- i18n: traduzioni Discussions in 7 lingue
+
+## 🔧 v1.0.6 - 2026-01-28
+
+- Qwen 3: Provider dedicato per lingue asiatiche (CN/JP/KR) via Ollama
+- NLLB-200: Supporto 200 lingue via HuggingFace Inference API
+- Ollama Generico: Usa qualsiasi modello installato
+- Bug fix: Catch vuoti sostituiti con logging appropriato
+- Bug fix: Import non utilizzati rimossi dai file principali
+- Bug fix: Vitest config provider v8 mancante
+- Bug fix: Firme funzioni batch operations incompatibili
+- i18n: Traduzioni mancanti aggiunte per ES, FR, DE, JA, ZH
+
+## 📝 v1.0.5 - 2026-01-26
+
+- Voice Clone Studio: AI voice cloning with ElevenLabs and OpenAI TTS
+- VR Text Overlay: Spatial subtitles for VR games with headset detection
+- Quality Gates: Automatic translation quality control system
+- Player Feedback: Collect and manage player translation feedback
+- Guide Page: Documentation for all 4 new tools
+- i18n: Translations for all new features in 7 languages (IT, EN, ES, DE, JA, ZH)
+- UI: Green hero headers for Tools section pages
+
+## 📝 v1.0.4 - 2026-01-23
+
+- Subtitle Translator: parser SRT/VTT/ASS con preview e QA
+- Batch Folder Translator: scansione ricorsiva cartelle con walkdir
+- Community Hub: pagina completa con browser pacchetti TM
+- Retro ROM Tools: supporto NES/SNES/GB/GBA/Genesis/PSX con table files
+- API Pubblica v1: endpoint REST per CI/CD (/api/v1/translate, batch, languages, health)
+- Landing Page: pagina marketing pronta per deploy
+- Screen Adaptation: adattamento automatico risoluzione schermo
+- Tutorial unificato: risolto conflitto tra OnboardingWizard e InteractiveTutorial
+- Hero headers compatti per Retro e Batch
+
+## 📝 v1.0.3 - 2026-01-22
+
+- Recovery Key: sistema recupero password con 12 parole mnemoniche
+- Recovery Key: copia/download chiave alla creazione profilo
+- Recovery Key: verifica chiave per reset password
+- Traduzioni i18n complete per ES, FR, DE (9 sezioni aggiunte)
+- Nuove sezioni: gameDetails, notifications, stores, projects, heatmap, activity, ocrTranslator, workshop
+
+## 📝 v1.0.2 - 2026-01-22
+
+- Supporto multilingua completo: ES, FR, DE, JA, ZH
+- Selettore lingua abilitato per tutte le lingue
+- Traduzioni Translation Fixer per tutte le lingue
+- Traduzioni AI Context Crawler per tutte le lingue
+- Categorie glossario tradotte (personaggio, luogo, oggetto, etc.)
+
+## 🔧 v1.0.1 - 2026-01-21
+
+- Nuovo layout 3:1 per pagina dettaglio gioco
+- Screenshot gallery espansa (12 screenshot)
+- Raccomandazione traduzione full-width
+- Traduzioni EN complete per gameDetails
+- Trama completa nell'header hero
+
+## 💥 v1.0.0 - 2026-01-20
+
+- Release pubblica ufficiale
+- Sistema i18n completo (Italiano/English)
+- Hero Image Fusion per tutte le pagine
+- Screenshot Gallery nella pagina dettaglio
+- GitHub Sponsors integrato
+
+## 📝 v0.9.9-beta - 2026-01-19
+
+- Ultima versione beta prima del release ufficiale 1.0.0
+- Sistema i18n completo (Italiano/English)
+- Integrazione Ko-fi e GitHub Sponsors
+- Ottimizzazioni finali e bug fix
+
+## 📝 v0.9.8-beta - 2026-01-18
+
+- Esporta/Importa Profilo: backup e restore profili come JSON
+- OCR Service: Tesseract.js integrato per riconoscimento testo
+- Screen Capture: cattura schermo con fallback browser getDisplayMedia
+- Hero headers tutti compatti con text shadow uniforme
+- Community Hub ridisegnato con stile compatto
+- Libreria header minimalista con icona gradient
+- Rimosso mini logo GS dalla sidebar chiusa
+
+## 📝 v0.9.7-beta - 2026-01-18
+
+- Hero headers compatti per tutti gli strumenti (Overlay, Fixer, Crawler, Voice, Injector, Patcher)
+- Dashboard ridisegnata con gradiente viola e card animate
+- Menu profilo glassmorphism con effetto vetro
+- Game Patcher header unificato con quick links
+- Attività recenti espanse a 9 elementi
+- Rimossi indicatori Neural/Steam/Cache dall'header
+- Text shadows migliorati per leggibilità su gradienti chiari
+
+## 📝 v0.9.6-beta - 2026-01-12
+
+- Command Palette (Ctrl+K): ricerca globale stile VS Code
+- Skeleton Loaders: loading states eleganti per tutte le pagine
+- Empty States: illustrazioni e CTA per stati vuoti
+- Drag & Drop Zone: trascina file per tradurre
+- Info Tooltips: spiegazioni hover per funzioni complesse
+- Sidebar animata: hover effects, glow, transizioni fluide
+- Toast migliorati: gradienti colorati, progress bar, animazioni
+- Keyboard Shortcuts: Ctrl+L libreria, Ctrl+T traduci, etc.
+
+## 📝 v0.9.5-beta - 2026-01-12
+
+- Steam Workshop Browser: cerca e scarica traduzioni dalla community
+- Filtri per lingua, ordinamento (popolarità, recenti, rating)
+- Visualizzazione dettagli: subscribers, favorites, views, rating
+- Download simulato con stato installazione
+- Link diretto a Steam Workshop per ogni item
+
+## 📝 v0.9.4-beta - 2026-01-12
+
+- Dashboard completamente ridisegnata con hero header viola/fuchsia
+- Card Azioni Rapide con icone grandi e gradienti colorati
+- Link rapidi a Batch, Progetti, Statistiche, Impostazioni
+- Attività recenti in card dedicata con design cyan
+- Progress bar traduzioni con card emerald
+
+## 📝 v0.9.3-beta - 2026-01-12
+
+- Statistiche Traduzione: dashboard dettagliata con grafici
+- Grafico attività settimanale con barre
+- Stats: traduzioni totali, stringhe, parole, progress medio
+- Conteggio progetti completati e in corso
+- Lingue target più usate con percentuali
+- Tempo stimato rimanente per progetti attivi
+
+## 📝 v0.9.2-beta - 2026-01-12
+
+- Project Manager: salva/carica progetti di traduzione (.gsproj)
+- Esporta traduzioni in JSON, CSV, PO (Gettext)
+- Glossario progetto per consistenza terminologica
+- Statistiche progetto: file, stringhe, progress
+- Tab Panoramica, File, Glossario, Impostazioni
+
+## 📝 v0.9.1-beta - 2026-01-12
+
+- Batch Translation: coda di traduzione per più file simultanei
+- Supporto drag & drop file e cartelle nella coda
+- Progress tracking per ogni job con tempo stimato
+- Pausa/riprendi/stop elaborazione coda
+- Gradiente dinamico pagina gioco basato sul genere (Horror=rosso, RPG=viola, etc.)
+
+## 📝 v0.9.0-beta - 2026-01-12
+
+- Pagina Dettaglio Gioco: nuovo hero header con gradiente indigo/purple/fuchsia
+- Stats dinamiche: piattaforma, stato installazione, data uscita, generi, traduzioni
+- Background immagine gioco integrato nell'header
+- Metacritic score con colori dinamici (verde/giallo/rosso)
+
+## 📝 v0.8.9-beta - 2026-01-08
+
+- Sidebar riorganizzata: da 17 a 6 elementi per navigazione pulita
+- Header hero colorati per pagine Traduci, Patcher, Community, Impostazioni
+- Dialog Impostazioni Profilo con design viola/pink e card colorate
+- Dialog Sicurezza Profilo con design cyan/emerald
+- Link rapidi agli strumenti secondari nelle pagine principali
+- Fix accessibilità DialogTitle con VisuallyHidden
+
+## 📝 v0.8.8-beta - 2026-01-08
+
+- Wizard Onboarding per primo avvio con configurazione guidata
+- Indicatore stato offline nell'header con feature disponibili
+- Sistema cache offline per traduzioni, giochi e pack
+- Tooltip contestuali per aiuto in-app
+- Servizio offline-support per funzionalità senza internet
+
+## 📝 v0.8.7-beta - 2026-01-08
+
+- Visual Translation Editor per preview stringhe su screenshot
+- Editor overlay con drag & drop, font, colori, opacità
+- Esportazione immagini PNG e progetti .gsvte
+- Nexus Mods Integration per cercare patch italiane
+- Ricerca automatica traduzioni per gioco
+- Download diretto da Nexus Mods (richiede API key)
+
+## 📝 v0.8.6-beta - 2026-01-08
+
+- Community Translation Hub per condivisione traduzioni
+- Sistema Translation Packs con download/upload
+- Rating e recensioni per pack traduzioni
+- Statistiche community in tempo reale
+- Filtri avanzati per ricerca pack
+- Supporto 10 lingue per traduzioni
+
+## 📝 v0.8.5-beta - 2026-01-08
+
+- AI Translation Assistant con supporto LLM locali (Ollama, LM Studio)
+- Traduzioni context-aware per genere gioco (RPG, Horror, etc.)
+- Glossario personalizzabile per consistenza terminologica
+- Supporto voci personaggi con stile e formalità
+- Generazione alternative di traduzione
+- Cronologia traduzioni con riutilizzo rapido
+
+## 🔧 v0.8.4-beta - 2026-01-08
+
+- Dialog Impostazioni Profilo (notifiche, libreria, sessione)
+- Dialog Sicurezza Profilo (cambio password, eliminazione)
+- Menu profilo completamente funzionale
+- Integrazione ThemeSelector nelle impostazioni profilo
+
+## 🔧 v0.8.3-beta - 2026-01-08
+
+- Parser Godot Engine (.tres, .tscn, .cfg, .translation)
+- Parser Ren'Py (.rpy) per visual novel
+- Telltale Patcher: backup automatico e ripristino
+- Telltale Patcher: verifica installazione
+- Theme toggle (chiaro/scuro/auto) nell'header
+- Script version-manager sincronizza tutti i file versione
+
+## 🔧 v0.8.2-beta - 2026-01-08
+
+- Telltale Patcher per Wolf Among Us, Walking Dead, Batman
+- Parser Telltale (.langdb, .landb, .dlog)
+- Fix immagini giochi nella pagina dettaglio
+- Steam API 403 rate limiting gestito gracefully
+- Tauri CLI aggiornato a v2.5.0
+
+## 🔧 v0.8.1-beta - 2026-01-04
+
+- Dizionario righe compatte
+- Estensioni layout unificato con Parser
+- Campanella notifiche gialla fosforescente
+- Placeholder colorati per copertine mancanti
+
+## 🚀 v0.8.0-beta - 2026-01-02
+
+- Integrazione Epic Games Store via Legendary CLI
+- Filtro asset/plugin Unreal Engine (41 giochi)
+- Badge piattaforma Epic Games nella scheda gioco
+- Versione cliccabile per vedere changelog
+
+## 🔧 v3.2.2 - 2025-07-07
+
+- Implementato sistema versioning automatico completo
+- Integrazione UI dinamica
+- Git hooks configurati
+
+## 🔧 v3.2.1 - 2025-01-07
+
+- Sistema versioning automatico implementato
+- System Status spostato nella sidebar
+- Dashboard layout migliorato
+- Quick Actions compattate
+
+## 🚀 v3.2.0 - 2025-01-06
+
+- Pagina impostazioni completamente ridisegnata
+- Debug tools integrati nelle impostazioni
+- Sidebar collassabile con animazioni
+- Steam API debugging migliorato
+
+## 🚀 v3.1.0 - 2025-01-05
+
+- Force refresh implementato per Steam games
+- Sistema manual game addition
+- Badge system per VR games
+- Dashboard design futuristico
+
